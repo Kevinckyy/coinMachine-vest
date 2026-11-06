@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VEST Control</title><link rel="stylesheet" href="popup.css"></head>
+<body>
+  <header><span class="logo">V</span><div><b>VEST <em>CONTROL</em></b><small>账户自动识别 · 0.3.9</small></div><span id="modeBadge">只读</span></header>
+  <main>
+    <p class="hint">在已登录的 <b>next.vestmarkets.com/trade/NQ-PERP</b> 页面打开。读到账户后自动显示在工作台。</p>
+    <label>本地配对码<input id="token" type="password" placeholder="从工作台「浏览器连接」复制" autocomplete="off"></label>
+    <section class="card mode-card"><div class="mode-heading"><div><b>账户控制模式</b><small>唯一的交易执行开关</small></div><label class="mode-switch"><span>只读</span><input id="modeSwitch" type="checkbox" disabled role="switch" aria-label="只读或执行模式"><span class="switch-track"></span><span>执行</span></label></div><p id="modeDescription">只同步账户信息；工作台不能向此页面发送交易操作。</p><p class="hint">开启后等待工作台任务；有任务才切换目标账户，并自动选择 USD 止损单位及 Micro 微型数量单位。切回只读立即停止后续操作；已提交到平台的订单继续确认结果。</p></section>
+    <section class="card readonly-card"><div class="card-title">Vest 账户 <span id="accountCount">尚未读取</span></div><p>自动读取账户列表、现金余额、净值和浮盈亏；执行时自动切换到任务对应的账户。</p><div class="actions"><button id="readAccounts">读取 / 刷新账户</button><button id="connectPage" class="secondary">检测页面连接</button></div><div id="readProgress" role="status" class="hint">粘贴配对码后直接读取账户。</div><div id="accountsSummary"></div></section>
+    <p class="hint">主账户永久排除所有执行，仅展示信息。重载扩展、刷新页面或服务重启后默认只读。同名账户或页面状态无法确认时不执行订单。</p>
+    <pre id="status" role="status">等待本地服务 http://127.0.0.1:8765</pre>
+    <pre id="executionError" class="error" role="alert" hidden></pre>
+  </main><script src="core.js"></script><script src="popup.js"></script>
+</body></html>

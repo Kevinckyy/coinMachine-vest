@@ -1,0 +1,35 @@
+{
+  "name": "coinmachine-vest",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:web": "vite --host 127.0.0.1",
+    "dev:server": "python -m server.app",
+    "prebuild": "node scripts/package-extension.mjs",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "test": "python -m unittest discover -s tests -v",
+    "test:extension": "node --test tests/extension.test.mjs tests/extension-connection.test.mjs tests/extension-mode.test.mjs",
+    "test:extension:browser": "node scripts/extension-browser-smoke.mjs",
+    "test:browser": "node scripts/browser-smoke.mjs",
+    "test:strategy:browser": "node scripts/strategy-browser-smoke.mjs",
+    "test:backtest:browser": "node scripts/backtest-browser-smoke.mjs",
+    "package:extension": "node scripts/package-extension.mjs"
+  },
+  "dependencies": {
+    "lightweight-charts": "^5.0.0",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "~5.7.2",
+    "vite": "^6.1.0"
+  }
+}

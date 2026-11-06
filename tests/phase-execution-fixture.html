@@ -1,0 +1,126 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Isolated phase execution regression</title></head><body>
+<button data-testid="account-selector-trigger"><span class="truncate">Phase Trader</span><span id="category">Evaluation</span></button>
+<p data-testid="account-value">$5,000.00</p><p data-testid="account-upnl">$0.00</p><p data-testid="book-mark">$100.00</p>
+<div class="sticky top-14"><span id="phase" data-slot="badge">第 1/2 阶段</span></div>
+<div data-testid="order-form">
+  <button data-testid="ordertype-tab-market" aria-selected="true">Market</button>
+  <input data-testid="size-input" value="1"><button data-testid="size-unit-select" data-unit="micro">Micro</button>
+  <button data-testid="tpsl-unit-usd" aria-selected="true">USD</button>
+  <input data-testid="tpsl-input-tp" value=""><input data-testid="tpsl-input-sl" value="130">
+  <button data-testid="tpsl-limit-switch" aria-checked="false">Limit off</button>
+  <button data-testid="submit-long">Buy</button><button data-testid="submit-short">Sell</button>
+</div>
+<button data-testid="account-tab-active-positions" aria-selected="true" aria-controls="positions">Active Positions</button>
+<div id="positions"><p>No positions yet</p></div>
+<script>
+(() => {
+  // All clicks and messages stay inside this fake document. No trading service
+  // or real account is connected; exercise the actual content-script pipeline.
+  const account = {id:'phase-trader',name:'Phase Trader',category:'eval',identity:'eval:Phase Trader',
+    phase:'1/2',auto_discovered:true,current:true,balance:5000,equity:5000,unrealized_pnl:0,observed_at:Date.now()/1000};
+  const state = {epoch:0,handler:null,timer:null,job:null,mutate:null,messages:[],storage:{},opens:0,closes:0,counter:0};
+  const clone = value => structuredClone(value);
+  const el = id => document.querySelector(`[data-testid="${id}"]`);
+  const assert = (value,message) => {if (!value) throw new Error(message);};
+  const response = extra => ({ok:true,data:{mode:'execute',mode_epoch:state.epoch,accounts:[clone(account)],...extra}});
+  const flat = () => {document.getElementById('positions').innerHTML='<p>No positions yet</p>';};
+  const position = () => {
+    document.getElementById('positions').innerHTML = `<table><tbody><tr>
+      <td><a href="/trade/NQ-PERP"><p data-testid="position-symbol-phase-pos">NQ</p><p data-testid="position-side-phase-pos">Long</p></a></td>
+      <td><p><span data-testid="position-value-phase-pos">$200.00</span></p><p>2.0000 NQ</p></td>
+      <td><span data-testid="position-entry-phase-pos">$100.00</span></td>
+      <td data-testid="td-tpsl"><span class="text-short">$35.00</span></td>
+      <td><button data-testid="position-close-phase-pos">Close</button></td>
+    </tr></tbody></table>`;
+    el('position-close-phase-pos').onclick = () => {state.closes++;flat();};
+  };
+  el('submit-long').onclick = () => {state.opens++;position();};
+  el('submit-short').onclick = () => {throw new Error('Unexpected short order');};
+  globalThis.setInterval = callback => {state.timer=callback;return 1;};
+  Object.defineProperty(globalThis,'chrome',{configurable:true,value:{runtime:{id:'isolated-phase-execution',
+    onMessage:{addListener:handler=>{state.handler=handler;}},sendMessage:async message=>{
+      state.messages.push(clone(message));
+      if (message.type==='observation-restore') return {ok:true,data:{enabled:true,mode_epoch:0,accounts:[clone(account)]}};
+      if (message.type==='mode-heartbeat' || message.type==='observe') return response({});
+      if (message.type==='execution-next') return response({next_account:{...clone(account),operation:state.job?.type || 'monitor'}});
+      if (message.type==='poll') {
+        assert(message.phase===account.phase && message.snapshot.phase===(account.phase || undefined),'Mismatched phase in poll');
+        const job=state.job;state.job=null;
+        if (state.mutate) {state.mutate();state.mutate=null;}
+        return response({job});
+      }
+      if (message.type==='result' || message.type==='execution-failed') return response({});
+      throw new Error('Unexpected bridge message: '+message.type);
+    }},storage:{local:{get:async key=>({[key]:clone(state.storage[key])}),set:async values=>Object.assign(state.storage,clone(values))},
+      onChanged:{addListener:()=>{}}}}});
+  history.replaceState(null,'','/trade/NQ-PERP');
+  const send = message => new Promise(resolve=>state.handler(message,{},resolve));
+  const setPhase = phase => {
+    account.phase=phase;
+    const badge=document.getElementById('phase');badge.hidden=!phase;badge.textContent=phase==='live'?'Live':`第 ${phase} 阶段`;
+  };
+  async function setup(phase) {
+    state.messages=[];state.opens=0;state.closes=0;state.job=null;state.mutate=null;flat();setPhase(phase);
+    el('account-selector-trigger').querySelector('.truncate').textContent=account.name;
+    account.category=phase==='live'?'funded':'eval';account.identity=account.category+':'+account.name;
+    document.getElementById('category').textContent=phase==='live'?'Funded':'Evaluation';
+    const armed=await send({type:'control-mode',mode:'execute',mode_epoch:++state.epoch,session_id:'phase-fixture',accounts:[clone(account)]});
+    assert(armed.ok,'Fixture could not enable execution');
+  }
+  async function deliver(type) {
+    state.job={id:'phase-job-'+(++state.counter),account_id:account.id,phase:account.phase,type,symbol:'NQ-PERP',side:'buy',quantity:2,
+      take_profit:null,stop_loss:130,...(type==='close'?{browser_position_id:'phase-pos'}:{})};
+    const id=state.job.id;
+    await state.timer();
+    const result=state.messages.find(message=>message.type==='result' && message.result.job_id===id)?.result;
+    return result;
+  }
+  globalThis.runPhaseExecutionFixtureTests = async () => {
+    await new Promise(resolve=>setTimeout(resolve,20));
+    const checks=[];
+    for (const phase of ['1/2','2/2','live',null]) {
+      await setup(phase);
+      const opened=await deliver('open');
+      assert(opened?.success && opened.confirmed,`${phase}: opening failed: `+JSON.stringify(state.messages.filter(m=>['result','execution-failed'].includes(m.type))));
+      assert(opened.snapshot.phase===(phase || undefined) && opened.snapshot.quantity===2 && opened.snapshot.native_sl,'Opening snapshot lost phase, size or stop loss');
+      const closed=await deliver('close');
+      assert(closed?.success && closed.confirmed && closed.snapshot.position_open===false,`${phase}: closing failed`);
+      await state.timer();
+      assert(state.opens===1 && state.closes===1 && !state.messages.some(m=>m.type==='execution-failed'),'Repeated action or unwanted read-only switch');
+      checks.push(`${phase || 'unknown'}: opening, closing and confirmation`);
+    }
+    for (const [label,mutate] of [
+      ['name',()=>{el('account-selector-trigger').querySelector('.truncate').textContent='Other Account';}],
+      ['phase',()=>{document.getElementById('phase').textContent='第 2/2 阶段';}],
+      ['category',()=>{document.getElementById('category').textContent='Funded';}],
+    ]) {
+      await setup('1/2');state.mutate=mutate;
+      const result=await deliver('open');
+      assert(result && !result.success && state.opens===0 && state.closes===0,`${label}: changed identity allowed an order`);
+      assert(state.messages.some(m=>m.type==='execution-failed'),`${label}: change did not revoke execution`);
+      checks.push(`changed ${label} blocks trading`);
+    }
+    await setup('1/2');position();
+    state.mutate=()=>{document.getElementById('category').textContent='Passed';};
+    const closed=await deliver('close');
+    assert(closed?.success && closed.confirmed && state.closes===1,'Same-account Passed transition prevented protective close');
+    assert(!state.messages.some(m=>m.type==='execution-failed'),'Passed transition revoked protective close');
+    checks.push('same-account Passed transition allows protective close');
+    const form=el('order-form');
+    const fees=document.createElement('div');fees.innerHTML='<div><p>Fee</p><p>$0.01 / 0.0025%</p></div><div><p id="slip-label">Slippage</p><p>$0.02 / 0.03%</p></div>';form.append(fees);
+    let observed=await send({type:'observe-current'});
+    assert(observed.execution_costs?.fee_bps===.25 && observed.execution_costs.slippage_bps===3,'Visible fee/slippage percentages were not read from the order form');
+    document.getElementById('slip-label').textContent='Slippage tolerance';
+    observed=await send({type:'observe-current'});
+    assert(observed.execution_costs?.fee_bps===.25 && observed.execution_costs.slippage_bps===undefined,'Tolerance was misreported as estimated slippage');
+    document.getElementById('slip-label').textContent='Slippage';el('size-input').value='0';
+    observed=await send({type:'observe-current'});
+    assert(observed.execution_costs?.slippage_bps===undefined,'Zero-quantity slippage was accepted');
+    fees.append(fees.firstElementChild.cloneNode(true));
+    observed=await send({type:'observe-current'});
+    assert(observed.execution_costs===null,'Ambiguous fee rows were accepted');
+    checks.push('read-only order-form fee and estimated slippage capture','tolerance, zero quantity and ambiguous quote rejection');
+    return {ok:true,checks};
+  };
+})();
+</script></body></html>

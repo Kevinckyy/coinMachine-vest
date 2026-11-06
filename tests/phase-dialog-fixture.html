@@ -1,0 +1,139 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Isolated first-stage completion dialog</title></head><body>
+<button data-testid="account-selector-trigger"><span class="truncate">Same Name</span><span>Evaluation</span></button>
+<p data-testid="account-value">$5,100.00</p><p data-testid="account-upnl">$0.00</p><p data-testid="book-mark">$100.00</p>
+<div class="sticky top-14"><span id="phase" data-slot="badge">第 1/2 阶段</span></div>
+<div data-testid="order-form">
+  <button data-testid="ordertype-tab-market" aria-selected="true">Market</button>
+  <input data-testid="size-input" value="1"><button data-testid="size-unit-select" data-unit="micro">Micro</button>
+  <button data-testid="tpsl-unit-usd" aria-selected="true">USD</button>
+  <input data-testid="tpsl-input-tp"><input data-testid="tpsl-input-sl" value="130">
+  <button data-testid="tpsl-limit-switch" aria-checked="false">Limit off</button>
+  <button data-testid="submit-long">Buy</button><button data-testid="submit-short">Sell</button>
+</div>
+<button data-testid="account-tab-active-positions" aria-selected="true" aria-controls="positions">Active Positions</button>
+<div id="positions"><p>No positions yet</p></div>
+<script>
+(() => {
+  const account={id:'same-account',name:'Same Name',phase:'1/2',category:'eval',identity:'eval:Same Name',auto_discovered:true,
+    current:true,balance:5100,equity:5100,unrealized_pnl:0,observed_at:Date.now()/1000};
+  const state={handler:null,timer:null,epoch:0,mode:'readonly',clicks:0,messages:[],idle:true,locale:'zh',onRoute:false,onPoll:false,job:null,offset:0};
+  const now=Date.now.bind(Date);Date.now=()=>now()+state.offset;
+  const copy=value=>structuredClone(value);
+  const assert=(value,message)=>{if(!value)throw new Error(message);};
+  const send=message=>new Promise(resolve=>state.handler(message,{},resolve));
+  const response=extra=>({ok:true,data:{mode:state.mode,mode_epoch:state.epoch,accounts:[copy(account)],...extra}});
+  const forbidden=()=>{throw new Error('A real trading or dismiss action was clicked');};
+  document.querySelector('[data-testid="submit-long"]').onclick=forbidden;
+  document.querySelector('[data-testid="submit-short"]').onclick=forbidden;
+  function show(ready=false) {
+    document.querySelector('[role="dialog"]')?.remove();
+    const dialog=document.createElement('div');dialog.setAttribute('role','dialog');
+    dialog.innerHTML=state.locale==='zh'?
+      '<h2 data-slot="dialog-title">第 1 阶段已完成！</h2><p data-slot="dialog-description">我们正在准备第 2/2 阶段。准备期间，您可以关闭此窗口。</p><div data-testid="step-status"><p></p></div><button id="advance">开始下一阶段</button><button id="dismiss">知道了</button>':
+      '<h2 data-slot="dialog-title">Step 1 Completed!</h2><p data-slot="dialog-description">We\'re preparing Step 2 of 2. You can close this window while we get it ready.</p><div data-testid="step-status"><p></p></div><button id="advance">Start Next Step</button><button id="dismiss">Got It</button>';
+    document.body.append(dialog);
+    document.getElementById('advance').onclick=()=>{state.clicks++;};
+    document.getElementById('dismiss').onclick=forbidden;
+    readiness(ready);
+  }
+  function readiness(ready) {
+    document.querySelector('[data-testid="step-status"] p').textContent=state.locale==='zh'?
+      ready?'第 2 阶段已准备就绪。':'正在准备第 2 阶段...':ready?'Step 2 is ready.':'Preparing Step 2...';
+    const button=document.getElementById('advance');button.disabled=!ready;button.setAttribute('aria-busy',String(!ready));
+  }
+  function successor() {
+    document.querySelector('[role="dialog"]').remove();
+    document.getElementById('phase').textContent='第 2/2 阶段';
+    document.querySelector('[data-testid="account-value"]').textContent='$5,000.00';
+  }
+  globalThis.setInterval=callback=>{state.timer=callback;return 1;};
+  Object.defineProperty(globalThis,'chrome',{configurable:true,value:{runtime:{id:'phase-dialog-fixture',onMessage:{addListener:handler=>{state.handler=handler;}},sendMessage:async message=>{
+    state.messages.push(copy(message));
+    if(message.type==='observation-restore')return{ok:true,data:{enabled:true,mode_epoch:0,accounts:[copy(account)]}};
+    if(message.type==='mode-heartbeat')return response({});
+    if(message.type==='execution-next'){
+      if(state.onRoute){state.onRoute=false;show(true);}
+      return response({next_account:state.idle?null:{...copy(account),operation:state.onPoll?'open':'monitor'}});
+    }
+    if(message.type==='observe'){
+      const row=message.accounts.find(item=>item.name===account.name);
+      if(row?.phase==='2/2'){
+        assert(row.phase_snapshot?.phase==='2/2' && row.phase_snapshot.position_open===false,'Missing new-phase flat proof');
+        Object.assign(account,copy(row));
+        state.job=null; // Mirrors the backend's archival on verified phase change.
+      }
+      return response({});
+    }
+    if(message.type==='poll'){
+      assert(message.phase===account.phase && message.snapshot.phase===account.phase,'Wrong phase polled');
+      if(state.onPoll && message.ready){
+        state.onPoll=false;show(true);
+        state.job={id:'old-phase-job',account_id:account.id,phase:'1/2',type:'open',symbol:'NQ-PERP',side:'buy',quantity:2,stop_loss:130,take_profit:null};
+        return response({job:copy(state.job)});
+      }
+      return response({job:null});
+    }
+    if(message.type==='execution-failed'){state.mode='readonly';return response({});}
+    if(message.type==='result')throw new Error('A stage transition invented a trading receipt');
+    throw new Error('Unexpected message: '+message.type);
+  }},storage:{local:{get:async()=>({}),set:async()=>{}},onChanged:{addListener:()=>{}}}}});
+  history.replaceState(null,'','/trade/NQ-PERP');
+  async function mode(value) {
+    state.mode=value;
+    const result=await send({type:'control-mode',mode:value,mode_epoch:++state.epoch,session_id:'phase-dialog-session',accounts:[copy(account)]});
+    assert(result.ok,'Could not set fixture mode');
+  }
+  async function setup(locale='zh') {
+    for(const el of document.querySelectorAll('[role="dialog"],[role="alertdialog"],[data-testid="confirm-order-submit"]'))el.remove();
+    Object.assign(state,{locale,clicks:0,messages:[],idle:true,onRoute:false,onPoll:false,job:null,offset:0});
+    account.phase='1/2';account.balance=5100;account.equity=5100;
+    document.querySelector('[data-testid="account-selector-trigger"] .truncate').textContent=account.name;
+    document.getElementById('phase').textContent='第 1/2 阶段';
+    document.querySelector('[data-testid="account-value"]').textContent='$5,100.00';
+    document.querySelector('[data-testid="account-value"]').removeAttribute('aria-busy');
+    await mode('execute');
+  }
+  globalThis.runPhaseDialogFixtureTests=async()=>{
+    await new Promise(resolve=>setTimeout(resolve,20));
+    const checks=[];
+    for(const locale of ['zh','en']){
+      await setup(locale);show();await state.timer();
+      assert(state.clicks===0 && !state.messages.some(m=>m.type==='execution-failed'),'Preparing stage revoked permission or clicked');
+      readiness(true);document.getElementById('advance').disabled=true;await state.timer();assert(state.clicks===0,'Disabled button clicked');
+      document.getElementById('advance').disabled=false;document.getElementById('advance').setAttribute('aria-busy','true');await state.timer();assert(state.clicks===0,'Busy button clicked');
+      readiness(true);await state.timer();await state.timer();
+      assert(state.clicks===1,'Next stage was not clicked exactly once');
+      assert(state.messages.some(m=>m.type==='poll' && m.phase==='1/2' && m.ready===false && m.snapshot.balance===5100),'Old-phase flat snapshot was not retained');
+      successor();await state.timer();
+      assert(account.id==='same-account' && account.phase==='2/2' && account.balance===5000,'Same-name successor was not synchronized');
+      state.idle=false;await state.timer();
+      assert(state.messages.some(m=>m.type==='poll' && m.phase==='2/2'),'Next-stage monitoring did not resume');
+      assert(!state.messages.some(m=>['execution-failed','result','size'].includes(m.type)),'Transition revoked permission or traded');
+      checks.push(locale+': preparation, one click, old-phase snapshot, same-name 2/2 proof and monitoring');
+    }
+    for(const [label,mutate] of [
+      ['unrecognized dialog',()=>document.querySelector('[data-testid="step-status"]').remove()],
+      ['wrong completed step',()=>document.querySelector('[data-slot="dialog-title"]').textContent='第 2 阶段已完成！'],
+      ['wrong next step',()=>document.querySelector('[data-slot="dialog-description"]').textContent='进入实盘账户'],
+      ['order warning',()=>{const el=document.createElement('button');el.dataset.testid='confirm-order-submit';document.body.append(el);}],
+      ['extra dialog',()=>{const el=document.createElement('div');el.setAttribute('role','alertdialog');el.textContent='Risk';document.body.append(el);}],
+      ['different account',()=>document.querySelector('[data-testid="account-selector-trigger"] .truncate').textContent='Other Account'],
+      ['wrong current phase',()=>document.getElementById('phase').textContent='第 2/2 阶段'],
+    ]){
+      await setup();show(true);mutate();await state.timer();assert(state.clicks===0,label+' was accepted');checks.push(label+' is never clicked');
+    }
+    await setup();show(true);await mode('readonly');await state.timer();assert(state.clicks===0,'Read-only clicked next stage');checks.push('read-only does not advance');
+    await setup();show();await state.timer();await mode('readonly');readiness(true);await state.timer();assert(state.clicks===0,'Revoked permission clicked next stage');checks.push('revocation while preparing prevents click');
+    await setup();show(true);
+    const revoked=new Promise(resolve=>setTimeout(()=>mode('readonly').then(resolve),50));
+    await state.timer();await revoked;assert(state.clicks===0,'Revocation during old-phase sampling allowed a click');checks.push('revocation during old-phase sampling prevents click');
+    await setup();show(true);document.querySelector('[data-testid="account-value"]').setAttribute('aria-busy','true');await state.timer();
+    assert(state.clicks===1 && !state.messages.some(m=>m.type==='poll'),'Loading old-phase values were reported as settled');
+    successor();document.querySelector('[data-testid="account-value"]').removeAttribute('aria-busy');await state.timer();assert(account.phase==='2/2','Fresh successor proof was not synchronized');checks.push('loading old-phase values cannot fabricate a settlement');
+    await setup();state.idle=false;state.onRoute=true;await state.timer();assert(state.clicks===1,'Dialog appearing during monitoring was not handled');successor();await state.timer();assert(account.phase==='2/2','Late dialog did not synchronize');checks.push('dialog appearing during monitoring is handled');
+    await setup();state.idle=false;state.onPoll=true;await state.timer();assert(state.clicks===1 && state.job,'Delivered old-phase job was not held');successor();await state.timer();assert(account.phase==='2/2' && !state.job,'Delivered old-phase job was not retired on proof');assert(!state.messages.some(m=>m.type==='result'),'Old job got a fabricated result');checks.push('delivered old-phase job is retired only with new-phase flat proof');
+    await setup();show(true);await state.timer();state.offset=21000;await state.timer();assert(state.clicks===1 && state.messages.some(m=>m.type==='execution-failed'),'Unconfirmed transition repeated or did not stop');checks.push('unconfirmed transition stops without repeating click');
+    return{ok:true,checks};
+  };
+})();
+</script></body></html>

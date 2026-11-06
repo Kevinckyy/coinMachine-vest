@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>Read-only Vest account observation fixture</title><style>body{font:14px sans-serif;padding:20px}button{padding:8px} [role=menu]{border:1px solid #333;padding:8px} [role=menuitem]{padding:8px;cursor:pointer}</style></head><body>
+<p>This fixture is a simulated page. It never accesses a trading account or API.</p>
+<button data-testid="account-selector-trigger" aria-expanded="false"><span class="max-w-50 truncate">Alpha</span><span>Evaluation</span></button>
+<p data-testid="account-value">$987.50</p><p data-testid="account-upnl">-$12.50</p>
+<div class="sticky top-14" id="capital-banner"><p id="capital-goal">Step Goal: <span>$0.00 / $80.00</span></p><div>Max. Daily Loss <p data-testid="capital-indicator-daily-loss">$12.50 / $40.00</p></div><p id="capital-drawdown"><span>Max. Drawdown</span>: $12.50 / $100.00</p></div>
+<div style="display:none"><p data-testid="capital-indicator-goal">$8,000.00 / $9,000.00</p></div>
+<button data-testid="submit-long">Forbidden trading button</button>
+<pre id="fixture-result"></pre>
+<script>
+(() => {
+  'use strict';
+  const state = { handler: null, timer: null, menu: null, selected: 'alpha', selectionClicks: [], tradeClicks: 0,
+    uploads: [], pollCalls: 0, storage: {}, changes: [], moneyTimer: null, metricsTimer: null };
+  const accounts = [
+    { key:'alpha', name:'Alpha', category:'eval', equity:'$987.50', pnl:'-$12.50',daily:'$12.50 / $40.00',drawdown:'$12.50 / $100.00',goal:'$0.00 / $80.00' },
+    { key:'beta', name:'Beta', category:'funded', equity:'$1,275.50', pnl:'+$25.50',daily:'3%',drawdown:'$0.00 / $120.00' },
+    { key:'duplicate1', name:'Duplicate', category:'eval', equity:'$8,000.00', pnl:'$0.00' },
+    { key:'duplicate2', name:'Duplicate', category:'eval', equity:'$9,000.00', pnl:'$0.00' },
+    { key:'private', name:'Private', category:'funded', equity:'****', pnl:'****' },
+  ];
+  const trigger = document.querySelector('[data-testid="account-selector-trigger"]');
+  const money = document.querySelector('[data-testid="account-value"]');
+  const pnl = document.querySelector('[data-testid="account-upnl"]');
+  const capital = document.getElementById('capital-banner');
+  function renderMetrics(account) {
+    const daily=capital.querySelector('[data-testid="capital-indicator-daily-loss"]');daily.textContent=account.daily||'—';
+    document.getElementById('capital-goal').innerHTML='Step Goal: <span>'+(account.goal||'—')+'</span>';
+    document.getElementById('capital-drawdown').innerHTML='<span>Max. Drawdown</span>: '+(account.drawdown||'—');
+    capital.removeAttribute('aria-busy');
+  }
+  const clone = (value) => structuredClone(value);
+  function close() { state.menu?.remove(); state.menu = null; trigger.setAttribute('aria-expanded','false'); }
+  function select(account) {
+    state.selected=account.key; state.selectionClicks.push(account.key);
+    trigger.querySelector('span.truncate').textContent=account.name;
+    trigger.lastElementChild.textContent=account.category==='eval'?'Evaluation':'Funded';
+    close();
+    // Names update first. Money deliberately stays on the previous account for 600ms.
+    clearTimeout(state.moneyTimer);
+    state.moneyTimer=setTimeout(()=>{ money.textContent=account.equity; pnl.textContent=account.pnl; },600);
+    clearTimeout(state.metricsTimer);capital.setAttribute('aria-busy','true');
+    state.metricsTimer=setTimeout(()=>renderMetrics(account),900);
+  }
+  function open() {
+    if(state.menu) return;
+    const menu=document.createElement('div'); menu.setAttribute('role','menu'); menu.dataset.slot='dropdown-menu-content';
+    menu.addEventListener('keydown', event=>{ if(event.key==='Escape')close(); });
+    for(const account of accounts){
+      const row=document.createElement('div'); row.setAttribute('role','menuitem'); row.dataset.testid='account-item-'+account.category;
+      const heading=document.createElement('div'); const name=document.createElement('span'); name.className='mr-0.5 truncate text-sm'; name.textContent=account.name;
+      const badge=document.createElement('span'); badge.textContent=account.category==='eval'?'Evaluation':'Funded';
+      heading.append(name,badge); const upnl=document.createElement('span'); upnl.className='text-muted-foreground';upnl.textContent=account.pnl;
+      row.append(heading,upnl); row.addEventListener('click',()=>select(account)); menu.append(row);
+    }
+    state.menu=menu;document.body.append(menu);trigger.setAttribute('aria-expanded','true');
+  }
+  trigger.addEventListener('keydown',event=>{if(event.key==='ArrowDown')open();if(event.key==='Escape')close();});
+  trigger.addEventListener('pointerdown',()=>{state.menu?close():open();});
+  trigger.addEventListener('click',()=>{state.menu?close():open();});
+  document.querySelector('[data-testid="submit-long"]').onclick=()=>{state.tradeClicks++;throw new Error('Read-only mode clicked a trading control');};
+  globalThis.setInterval=(callback)=>{state.timer=callback;return 1;};
+  Object.defineProperty(globalThis,'chrome',{configurable:true,value:{
+    runtime:{id:'fixture-extension-id',onMessage:{addListener:handler=>{state.handler=handler;}},sendMessage:async message=>{
+      if(message.type==='observation-restore')return{ok:true,data:{enabled:false,accounts:[]}};
+      if(message.type==='observe'){state.uploads.push(clone(message));return{ok:true,data:{ok:true}};}
+      if(message.type==='poll')state.pollCalls++;
+      return{ok:false,error:'Fixture forbids trading/network messages'};
+    }},
+    storage:{local:{get:async key=>({[key]:state.storage[key]}),set:async values=>{Object.assign(state.storage,clone(values));for(const handler of state.changes)handler(Object.fromEntries(Object.entries(values).map(([key,value])=>[key,{newValue:clone(value)}])));}},onChanged:{addListener:handler=>state.changes.push(handler)}},
+  }});
+  if(location.protocol==='http:'||location.protocol==='https:')history.replaceState(null,'','/trade/NQ-PERP');
+  const send=message=>new Promise((resolve,reject)=>{try{state.handler(message,{},resolve);}catch(error){reject(error);}});
+  const assert=(condition,message)=>{if(!condition)throw new Error(message);};
+  globalThis.runAccountObservationFixtureTests=async()=>{
+    if(!state.handler||!state.timer)throw new Error('Inject extension/core.js and content.js first');
+    const cases=[];
+    const test=async(name,run)=>{try{await run();cases.push({name,passed:true});}catch(error){cases.push({name,passed:false,error:error.message});}};
+    await test('current account can be read without order form, trade binding or TP/SL configuration',async()=>{
+      const result=await send({type:'observe-current'});
+      assert(result.ok&&result.snapshot.equity===987.5&&result.snapshot.unrealized_pnl===-12.5&&result.snapshot.balance===1000,'Direct current account monetary fields were wrong');
+      assert(!document.querySelector('[data-testid="order-form"]'),'Fixture unexpectedly contains a trading form');
+    });
+    let scanned;
+    await test('account list scan reads each unique account after its deferred money update and restores original selection',async()=>{
+      scanned=await send({type:'observe-accounts'});
+      assert(scanned.ok&&scanned.restored&&scanned.accounts.length===5,'Scan or restoration failed');
+      const alpha=scanned.accounts.find(account=>account.name==='Alpha'),beta=scanned.accounts.find(account=>account.name==='Beta');
+      assert(alpha.balance===1000&&beta.balance===1250&&beta.equity===1275.5&&beta.unrealized_pnl===25.5,'Scan read stale money or confused equity with cash');
+      assert(state.selected==='alpha'&&!state.menu&&alpha.current,'Original viewing account was not restored');
+      assert(state.tradeClicks===0&&state.pollCalls===0,'Read-only scan entered trading code');
+    });
+    await test('duplicate-name accounts remain unknown and are never selected',async()=>{
+      const duplicates=scanned.accounts.filter(account=>account.name==='Duplicate');
+      assert(duplicates.length===2&&duplicates.every(account=>account.balance===null&&account.observed_at===null&&/重复/.test(account.read_error)),'Duplicates were assigned a guessed balance');
+      assert(!state.selectionClicks.some(key=>key.startsWith('duplicate')),'Duplicate account was selected');
+      assert(scanned.accounts.every(account=>account.platform_id===null),'Category or list index was used as a platform id');
+    });
+    await test('top-left metrics wait for account loading and never mix accounts or hidden duplicate widgets',async()=>{
+      const alpha=scanned.accounts.find(account=>account.name==='Alpha').capital_metrics;
+      const beta=scanned.accounts.find(account=>account.name==='Beta').capital_metrics;
+      assert(alpha.daily_loss.current===12.5&&alpha.daily_loss.limit===40&&alpha.drawdown.limit===100&&alpha.goal.limit===80,'Alpha metrics were missing or taken from a hidden widget');
+      assert(beta.daily_loss.percent===3&&beta.drawdown.limit===120&&beta.goal===null,'Beta inherited Alpha amounts or invented a goal');
+      assert(state.pollCalls===0&&state.tradeClicks===0,'Metric scan entered execution');
+    });
+    await test('Chinese top-left labels work without goal and drawdown test ids',async()=>{
+      document.getElementById('capital-goal').innerHTML='阶段目标： <span>+$25.00 / $300.00</span>';
+      document.getElementById('capital-drawdown').innerHTML='<span>最大回撤</span>： $15.00 / $150.00';
+      const result=await send({type:'observe-current'});
+      assert(result.ok&&result.snapshot.capital_metrics.goal.current===25&&result.snapshot.capital_metrics.goal.limit===300,'Chinese stage goal missing');
+      assert(result.snapshot.capital_metrics.drawdown.limit===150,'Chinese drawdown missing');
+      renderMetrics(accounts[0]);
+    });
+    await test('conflicting visible indicator copies are unavailable instead of selecting one arbitrarily',async()=>{
+      const duplicate=document.createElement('p');duplicate.dataset.testid='capital-indicator-daily-loss';duplicate.textContent='$99.00 / $200.00';capital.append(duplicate);
+      try { const result=await send({type:'observe-current'});assert(result.ok&&result.snapshot.capital_metrics.daily_loss===null,'Conflicting daily-loss readings were accepted'); }
+      finally {duplicate.remove();}
+    });
+    await test('hidden financial values remain unavailable rather than becoming zero',async()=>{
+      const account=scanned.accounts.find(account=>account.name==='Private');
+      assert(account.balance===null&&account.equity===null&&account.unrealized_pnl===null&&!!account.read_error,'Hidden money was converted into a number');
+    });
+    await test('periodic observation only refreshes the selected account and preserves other original observation timestamps',async()=>{
+      const betaTime=scanned.accounts.find(account=>account.name==='Beta').observed_at;
+      money.textContent='$990.00';pnl.textContent='-$10.00';await state.timer();
+      const latest=state.uploads.at(-1).accounts;
+      assert(latest.find(account=>account.name==='Alpha').equity===990,'Current-account observation did not refresh');
+      assert(latest.find(account=>account.name==='Beta').observed_at===betaTime,'Cached account timestamp was fabricated as fresh');
+      assert(state.pollCalls===0&&state.tradeClicks===0,'Periodic observation used trading polling');
+    });
+    await test('evaluation success is read from the explicit current-account badge',async()=>{
+      const clicks=state.selectionClicks.length;
+      trigger.lastElementChild.textContent='Passed';
+      const current=await send({type:'observe-current'});
+      assert(current.ok&&current.snapshot.category==='passed'&&current.snapshot.identity==='passed:Alpha','Evaluation pass was not reported from the account badge');
+      assert(state.selectionClicks.length===clicks&&state.tradeClicks===0,'Pass detection performed an unrelated action');
+      trigger.lastElementChild.textContent='Evaluation';
+    });
+    await test('second-row Chinese and English PnL labels override a stale card without opening accounts',async()=>{
+      const oldMoney=money.textContent,oldPnl=pnl.textContent,clicks=state.selectionClicks.length;
+      const banner=document.createElement('div');banner.className='sticky top-14';document.body.append(banner);
+      try {
+        for(const [label,value,equity,expected] of [['未实现盈亏：','-$101.52',4898.48,-101.52],['Unrealized PnL:','+$12.50',5012.50,12.5]]){
+          banner.innerHTML='<p><span>'+label+'</span> <span>'+value+'</span></p>';
+          money.textContent='$'+equity.toFixed(2);pnl.textContent='$999.00';
+          const current=await send({type:'observe-current'});
+          assert(current.ok&&current.snapshot.unrealized_pnl===expected&&current.snapshot.balance===5000,'Second-row PnL was not used: '+label);
+        }
+        assert(state.selectionClicks.length===clicks&&state.tradeClicks===0,'Reading the banner touched an account or trade control');
+      } finally {banner.remove();money.textContent=oldMoney;pnl.textContent=oldPnl;}
+    });
+    await test('hidden or conflicting second-row PnL cannot fall back to another card',async()=>{
+      const oldPnl=pnl.textContent;pnl.textContent='$99.00';
+      const banner=document.createElement('div');banner.className='sticky top-14';document.body.append(banner);
+      try {
+        for(const html of ['<p><span>未实现盈亏：</span> ****</p>','<p>未实现盈亏：-$1.00</p><p>Unrealized PnL: -$2.00</p>']){
+          banner.innerHTML=html;const current=await send({type:'observe-current'});
+          assert(!current.ok,'Hidden/conflicting banner used the unrelated card PnL');
+        }
+        banner.innerHTML='<p aria-busy="true">未实现盈亏：$10.00</p>';
+        assert(!(await send({type:'observe-current'})).ok,'Loading banner was accepted');
+      } finally {banner.remove();pnl.textContent=oldPnl;}
+    });
+    await test('hidden banner copies and unrelated PnL text outside the banner are ignored',async()=>{
+      const oldPnl=pnl.textContent;pnl.textContent='-$12.50';
+      const hidden=document.createElement('div');hidden.className='sticky top-14';hidden.style.display='none';hidden.innerHTML='<p>未实现盈亏：$999.00</p>';
+      const outside=document.createElement('p');outside.textContent='未实现盈亏：$888.00';document.body.append(hidden,outside);
+      try {const current=await send({type:'observe-current'});assert(current.ok&&current.snapshot.unrealized_pnl===-12.5,'Unrelated or hidden text replaced the valid card');}
+      finally {hidden.remove();outside.remove();pnl.textContent=oldPnl;}
+    });
+    await test('a pre-existing modal prevents account switching and trading clicks',async()=>{
+      const count=state.selectionClicks.length;const dialog=document.createElement('div');dialog.setAttribute('role','dialog');dialog.textContent='Manual risk warning';document.body.append(dialog);
+      const result=await send({type:'observe-accounts'});dialog.remove();
+      assert(result.ok&&result.error&&state.selectionClicks.length===count&&state.tradeClicks===0,'Read-only scan clicked behind a dialog');
+    });
+    await test('current phase is read from the second-row badge and risk metrics carry that exact phase',async()=>{
+      const clicks=state.selectionClicks.length,badge=document.createElement('span');badge.dataset.slot='badge';capital.prepend(badge);
+      try {
+        for(const [label,phase] of [['第 1/2 阶段','1/2'],['第 2/2 阶段','2/2'],['Live','live']]) {
+          badge.textContent=label;
+          const current=await send({type:'observe-current'});
+          assert(current.ok&&current.snapshot.phase===phase,'Explicit phase badge was not recognized: '+label);
+          assert(current.snapshot.capital_metrics.daily_loss.phase===phase,'Risk metric was associated with a different phase');
+        }
+        assert(state.selectionClicks.length===clicks&&state.tradeClicks===0&&state.pollCalls===0,'Reading phase clicked an account or trading control');
+        badge.textContent='Evaluation';
+        const unknown=await send({type:'observe-current'});
+        assert(!unknown.snapshot.phase,'Unknown phase was guessed from evaluation status');
+      } finally {badge.remove();}
+    });
+    const result={passed:cases.filter(item=>item.passed).length,failed:cases.filter(item=>!item.passed).length,total:cases.length,cases};
+    document.getElementById('fixture-result').textContent=JSON.stringify(result,null,2);return result;
+  };
+})();
+</script></body></html>

@@ -1,0 +1,107 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Isolated failure continuation fixture</title></head><body>
+<button data-testid="account-selector-trigger" aria-expanded="false"><span class="truncate">Alpha</span><span id="badge">Closed</span></button>
+<p data-testid="account-value">****</p><p data-testid="account-upnl">****</p><p data-testid="book-mark">$100.00</p>
+<button data-testid="account-tab-active-positions" aria-selected="true" data-state="active" aria-controls="positions">Active Positions</button>
+<div id="positions" role="tabpanel"><p>No positions yet</p></div>
+<div class="sticky top-14"><p data-testid="capital-indicator-drawdown">$0.00 / $300.00</p><p><span id="banner-pnl-label">未实现盈亏：</span> <span id="banner-pnl">****</span></p></div>
+<script>
+(() => {
+  const options=globalThis.failureFixtureOptions || {};
+  const legacyPnl=document.querySelector('[data-testid="account-upnl"]');
+  if(options.bannerOnly)legacyPnl.removeAttribute('data-testid');
+  if(options.pnlLabel)document.getElementById('banner-pnl-label').textContent=options.pnlLabel+':';
+  const nativeInterval=globalThis.setInterval.bind(globalThis);
+  const state={handler:null,timer:null,messages:[],retired:false,polls:[],selections:[],menu:null,
+    closed:!options.live&&!options.pendingOpening,metricTicks:0,marketTimer:null,menuOpens:0};
+  document.getElementById('badge').textContent=state.closed?(options.label || 'Closed'):'Evaluation';
+  const accounts=['Alpha','Beta'].map((name,index)=>({id:'fixture-'+index,name,category:'eval',identity:'eval:'+name,
+    auto_discovered:true,balance:5000,equity:5000,unrealized_pnl:0,observed_at:Date.now()/1000,current:index===0}));
+  const trigger=document.querySelector('[data-testid="account-selector-trigger"]');
+  const close=()=>{state.menu?.remove();state.menu=null;trigger.setAttribute('aria-expanded','false');};
+  const open=()=>{
+    if(state.menu)return;
+    state.menuOpens++;
+    const menu=document.createElement('div');menu.setAttribute('role','menu');
+    menu.addEventListener('keydown',event=>{if(event.key==='Escape')close();});
+    for(const account of (state.closed?accounts.slice(1):accounts)) {
+      const item=document.createElement('div');item.dataset.testid='account-item-eval';item.setAttribute('role','menuitem');
+      item.innerHTML='<span class="truncate">'+account.name+'</span><span>Evaluation</span>';
+      item.onclick=()=>{state.selections.push(account.name);trigger.querySelector('.truncate').textContent=account.name;document.getElementById('badge').textContent='Evaluation';
+        document.querySelector('[data-testid="account-value"]').textContent='$5,000.00';legacyPnl.textContent='$0.00';document.getElementById('banner-pnl').textContent='$0.00';close();};
+      menu.append(item);
+    }
+    document.body.append(menu);state.menu=menu;trigger.setAttribute('aria-expanded','true');
+  };
+  trigger.addEventListener('keydown',event=>{if(event.key==='ArrowDown')open();if(event.key==='Escape')close();});
+  trigger.onclick=()=>state.menu?close():open();
+  const registrations=()=>accounts.map(a=>a.name==='Alpha'&&state.retired?{...a,category:'closed',retired_failed:true,archived:true}:a);
+  const reply=extra=>({ok:true,data:{mode:'execute',mode_epoch:1,accounts:registrations(),...extra}});
+  globalThis.setInterval=callback=>{state.timer=callback;return 1;};
+  Object.defineProperty(globalThis,'chrome',{configurable:true,value:{
+    runtime:{id:'fixture-failure-extension',onMessage:{addListener:fn=>{state.handler=fn;}},sendMessage:async message=>{
+      state.messages.push(structuredClone(message));
+      if(message.type==='observation-restore')return{ok:true,data:{enabled:true,accounts:options.missingCache?accounts.filter(a=>a.name!=='Alpha'):accounts,mode_epoch:0}};
+      if(message.type==='mode-heartbeat')return reply({});
+      if(message.type==='execution-next')return reply({next_account:state.polls.includes('fixture-1') || (options.idle && !state.retired)?null:{...accounts[state.retired?1:0],operation:options.pendingOpening&&!state.retired?'open':'monitor'}});
+      if(message.type==='observe'){
+        if(message.accounts.some(a=>a.name==='Alpha'&&['failed','closed'].includes(a.category)&&Date.now()/1000-a.status_observed_at<5))state.retired=true;
+        return reply({});
+      }
+      if(message.type==='poll'){
+        if(options.live&&!state.closed&&message.snapshot.unrealized_pnl!==-state.metricTicks)throw new Error('Poll did not read current second-row unrealized PnL');
+        state.polls.push(message.account_id);return reply({job:null});
+      }
+      if(message.type==='execution-failed')return{ok:false,error:'Unexpected global execution shutdown'};
+      return{ok:false,error:'Unexpected fixture message: '+message.type};
+    }},storage:{local:{get:async()=>({}),set:async()=>{}},onChanged:{addListener:()=>{}}}
+  }});
+  history.replaceState(null,'','/trade/NQ-PERP');
+  const send=message=>new Promise(resolve=>state.handler(message,{},resolve));
+  const assert=(ok,message)=>{if(!ok)throw new Error(message);};
+  globalThis.runFailedAccountFixtureTests=async()=>{
+    await new Promise(resolve=>setTimeout(resolve,20));
+    assert((await send({type:'control-mode',mode:'execute',mode_epoch:1,session_id:'fixture-failed-session',accounts})).ok,'Enable fixture mode');
+    if (!state.closed) {
+      document.querySelector('[data-testid="account-value"]').textContent='$5,000.00';
+      legacyPnl.textContent='$0.00';document.getElementById('banner-pnl').textContent='$0.00';
+      if(options.live)document.getElementById('positions').innerHTML='<table><tbody><tr><td><a href="https://next.vestmarkets.com/trade/NDX-USD-PERP"><p data-testid="position-symbol-live-position">NQ</p><p data-testid="position-side-live-position">Long 10x</p></a></td><td><p><span data-testid="position-value-live-position">$400.00</span></p><p>4.0000 NQ</p></td><td><span data-testid="position-entry-live-position">$100.00</span></td><td data-testid="td-tpsl"><span>— / <span class="text-short">$37.50</span></span></td></tr></tbody></table>';
+      state.marketTimer=nativeInterval(()=>{
+        state.metricTicks++;
+        const pnl=options.live?-state.metricTicks:0;
+        const cash=5000+(options.live?state.metricTicks/10:0);
+        document.querySelector('[data-testid="account-value"]').textContent='$'+(cash+pnl).toFixed(2);
+        legacyPnl.textContent='$999.00'; // Deliberately stale legacy card.
+        document.getElementById('banner-pnl').textContent=pnl<0?'-$'+(-pnl).toFixed(2):'$0.00';
+        document.querySelector('[data-testid="capital-indicator-drawdown"]').textContent='$'+state.metricTicks+' / $300.00';
+      },80);
+      try {
+        await new Promise(resolve=>setTimeout(resolve,180));
+        await state.timer();
+        assert(!state.messages.some(m=>m.type==='execution-failed'),'Live metric changes or pre-dispatch read timeout revoked execution');
+        if(options.live) {
+          assert(state.polls.join()==='fixture-0' && state.metricTicks>0,'Changing live PnL/fees/metrics prevented position monitoring');
+          for(let round=0;round<2;round++){await new Promise(resolve=>setTimeout(resolve,120));await state.timer();}
+          assert(state.polls.length===3 && state.menuOpens===0,'Monitoring the selected account repeatedly opened its selector');
+        }
+        else assert(state.polls.length===0 && state.metricTicks>30,'An unstable opening read must wait before dispatch');
+      } finally {clearInterval(state.marketTimer);}
+      state.closed=true;
+      document.getElementById('badge').textContent='Closed';
+      document.getElementById('positions').innerHTML='<p>No positions yet</p>';
+      document.querySelector('[data-testid="account-value"]').textContent='****';
+      legacyPnl.textContent='****';document.getElementById('banner-pnl').textContent='****';
+    }
+    await state.timer();
+    assert(state.retired,'Explicit failure with hidden money was not published');
+    assert(!state.messages.some(m=>m.type==='execution-failed'),'Failure switched every account to read-only');
+    assert(state.polls.length===(options.live?3:0),'Failed account was polled or received trading work');
+    await state.timer();
+    assert(state.selections.join()==='Beta','Failed account blocked selecting the next account');
+    assert(state.polls.join()===(options.live?'fixture-0,fixture-0,fixture-0,fixture-1':'fixture-1'),'Next healthy account was not observed');
+    assert(state.menuOpens===1,'The account selector should open exactly once, to switch to Beta');
+    assert(!state.messages.some(m=>m.type==='execution-failed'),'Next account could not continue execution');
+    assert(!document.querySelector('[data-testid="order-form"]'),'Test must not depend on preparing trading inputs');
+    return{ok:true,metricTicks:state.metricTicks,menuOpens:state.menuOpens,checks:['direct second-row PnL','no selector opens while staying on the same account','Closed badge with hidden money','no global permission revoke','one selector open for the next account','no failed-account poll or trade']};
+  };
+})();
+</script></body></html>

@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>Local bridge DOM fixture</title>
+<style>body{font:14px sans-serif;padding:16px}button,input{padding:8px;margin:4px}td{padding:10px} [role=dialog]{position:fixed;inset:30px;background:white;border:2px solid red;padding:20px;z-index:10}</style>
+</head>
+<body>
+<p>This fixture only simulates DOM changes. It never contacts Vest or a trading service.</p>
+<button data-testid="account-selector-trigger">Fixture Unique Account Evaluation</button>
+<p data-testid="account-value">$1,000.00</p><p data-testid="account-upnl">$0.00</p>
+<p data-testid="book-mark">$20,100.00</p>
+<div data-testid="order-form">
+  <button data-testid="ordertype-tab-market" role="tab" aria-selected="true" data-state="active">Market</button>
+  <input data-testid="size-input" value="2">
+  <button data-testid="size-unit-select" data-unit="token">NQ</button>
+  <button data-testid="size-pct-25">25%</button><button data-testid="size-pct-50">50%</button><button data-testid="size-pct-75">75%</button><button data-testid="size-pct-100">100%</button><span role="slider" aria-valuenow="0"></span>
+  <button data-testid="tpsl-toggle" role="checkbox" aria-checked="true" data-state="checked">TP/SL</button>
+  <button data-testid="tpsl-unit-usd" role="tab" aria-selected="true" data-state="active">In dollars</button>
+  <input data-testid="tpsl-input-tp" value="100"><input data-testid="tpsl-input-sl" value="50">
+  <button data-testid="tpsl-limit-switch" role="switch" aria-checked="false" data-state="unchecked">Limit off</button>
+  <button data-testid="submit-long">Buy / Long</button><button data-testid="submit-short">Sell / Short</button>
+</div>
+<button data-testid="account-tab-active-positions" role="tab" aria-selected="true" data-state="active" aria-controls="fixture-positions">Active Positions</button>
+<div id="fixture-positions" role="tabpanel"><p>No positions yet</p></div>
+<pre id="fixture-result"></pre>
+<script>
+(() => {
+  'use strict';
+  const state = { storage: {}, changeHandlers: [], messageHandler: null, tick: null, nextJob: null, results: [], behavior: 'success', orderClicks: 0, closeClicks: 0, closeConfirmClicks: 0, counter: 0 };
+  const selector = (id) => '[data-testid="' + id + '"]';
+  const el = (id) => document.querySelector(selector(id));
+  const clone = (value) => value === undefined ? undefined : structuredClone(value);
+  document.addEventListener('keydown',event=>{
+    const unit=event.target.closest('[data-testid="size-unit-select"]');
+    if(!unit||event.key!=='ArrowDown')return;
+    const menu=document.createElement('div');menu.setAttribute('role','listbox');
+    for(const value of ['token','micro']){
+      const option=document.createElement('div');option.tabIndex=0;option.dataset.testid='size-unit-option-'+value;option.textContent=value;option.setAttribute('role','option');
+      const choose=()=>{unit.dataset.unit=value;unit.textContent=value==='micro'?'Micro':'NQ';menu.remove();};
+      option.onkeydown=e=>{if(e.key==='Enter')choose();};option.onclick=choose;menu.append(option);
+    }
+    document.body.append(menu);
+  });
+  // Capture the content script's timer; tests explicitly await each poll to avoid timing races.
+  globalThis.setInterval = (callback) => { state.tick = callback; return 1; };
+  const mockChrome = {
+    runtime: {
+      id: 'fixture-extension-id',
+      onMessage: { addListener: (handler) => { state.messageHandler = handler; } },
+      sendMessage: async (message) => {
+        if (message.type === 'poll') {
+          const job = state.nextJob; state.nextJob = null;
+          // Intentionally deliver even when ready=false: the content script must independently refuse unsafe jobs.
+          return { ok: true, data: { job } };
+        }
+        if (message.type === 'result') { state.results.push(clone(message.result)); return { ok: true, data: { ok: true } }; }
+        if (message.type === 'size') {
+          state.sizing = clone(message);
+          if (state.behavior === 'size-rejected') return {ok:false,error:'Fixture rejects sizing acknowledgment'};
+          const policy=message.drawdown ? {stop_loss:state.behavior==='wrong-stop-policy-ack'?130:message.stop_loss,stop_loss_omitted:message.stop_loss===null}:{};
+          if(state.behavior==='drawdown-crossed')document.querySelector('[data-testid="capital-indicator-drawdown"]').textContent='$799 / $1000';
+          return {ok:true,data:{job_id:message.job_id,quantity:message.quantity,size_percent:message.size_percent,...policy}};
+        }
+        return { ok: false, error: 'Fixture forbids all other messages' };
+      },
+    },
+    storage: {
+      local: {
+        get: async (keys) => {
+          if (keys == null) return clone(state.storage);
+          const names = typeof keys === 'string' ? [keys] : keys;
+          return Object.fromEntries(names.filter((key) => key in state.storage).map((key) => [key, clone(state.storage[key])]));
+        },
+        set: async (values) => {
+          const changes = {};
+          for (const [key, value] of Object.entries(values)) { changes[key] = { oldValue: clone(state.storage[key]), newValue: clone(value) }; state.storage[key] = clone(value); }
+          for (const handler of state.changeHandlers) handler(changes, 'local');
+        },
+      },
+      onChanged: { addListener: (handler) => state.changeHandlers.push(handler) },
+    },
+  };
+  Object.defineProperty(globalThis, 'chrome', { configurable: true, value: mockChrome });
+  // CDP should first navigate to any loopback page, then set this path and document.write this fixture.
+  if (location.protocol === 'http:' || location.protocol === 'https:') history.replaceState(null, '', '/trade/NQ-PERP');
+
+  function emptyPosition() { document.getElementById('fixture-positions').innerHTML = '<p>No positions yet</p>'; }
+  function showPosition({ id, side = 'buy', quantity = 2, withTP = true, withSL = true }) {
+    document.getElementById('fixture-positions').innerHTML = `
+      <table><tbody><tr>
+        <td><a href="https://next.vestmarkets.com/trade/NQ-PERP"><p data-testid="position-symbol-${id}">NQ</p><p data-testid="position-side-${id}">${side === 'buy' ? 'Long' : 'Short'} 10x</p></a></td>
+        <td data-testid="td-value"><div><p><span data-testid="position-value-${id}">$40,200.00</span></p><p>${quantity.toFixed(4)} NQ</p></div></td>
+        <td><span data-testid="position-entry-${id}">$20,100.00</span></td>
+        <td data-testid="td-tpsl"><div><span>${withTP ? '<span class="text-long">'+(side === 'buy' ? '$20,150.00' : '$20,050.00')+'</span>' : '—'} / ${withSL ? '<span class="text-short">'+(side === 'buy' ? '$20,075.00' : '$20,125.00')+'</span>' : '—'}</span></div></td>
+        <td><button data-testid="position-close-${id}">Close</button></td>
+      </tr></tbody></table>`;
+    el('position-close-' + id).onclick = () => {
+      state.closeClicks++;
+      const dialog = document.createElement('div'); dialog.setAttribute('role', 'dialog'); dialog.dataset.testid = 'close-dialog';
+      dialog.innerHTML = `<button data-testid="ordertype-tab-market" role="tab" aria-selected="true" data-state="active">Market</button>
+        <input data-testid="size-input" value="${quantity}"><button data-testid="size-unit-select" data-unit="token">NQ</button>
+        <button data-testid="size-pct-100">100%</button><span role="slider" aria-valuenow="100"></span>
+        <button data-testid="close-submit">Close ${quantity.toFixed(4)} NQ</button>`;
+      document.body.append(dialog);
+      dialog.querySelector(selector('close-submit')).onclick = () => { state.closeConfirmClicks++; emptyPosition(); dialog.remove(); };
+    };
+  }
+  function open(side) {
+    state.orderClicks++;
+    if (state.behavior === 'wrong-side') side = side === 'buy' ? 'sell' : 'buy';
+    const quantity = Number(el('size-input').value)*(el('size-unit-select').dataset.unit==='micro'?2:1) + (state.behavior === 'wrong-quantity' ? 1 : 0);
+    showPosition({ id: 'fixture-position-' + (++state.counter), side, quantity,
+      withTP:el('tpsl-input-tp').value.trim()!=='',withSL:state.behavior==='unexpected-stop' || (state.behavior!=='missing-stop' && el('tpsl-input-sl').value.trim()!=='') });
+    if(state.behavior==='missing-protection-cell')document.querySelector('[data-testid="td-tpsl"]').remove();
+    if(state.behavior==='native-ndx-link')document.querySelector('[data-testid^="position-symbol-"]').closest('a').href='https://next.vestmarkets.com/trade/NDX-USD-PERP';
+  }
+  el('submit-long').onclick = () => open('buy'); el('submit-short').onclick = () => open('sell');
+  el('tpsl-input-tp').oninput=()=>{if(state.behavior==='sticky-tp' && el('tpsl-input-tp').value==='')el('tpsl-input-tp').value='150';};
+  el('tpsl-input-sl').oninput=()=>{if(state.behavior==='sticky-sl' && el('tpsl-input-sl').value==='')el('tpsl-input-sl').value='130';};
+  for (const percent of [25,50,75,100]) el('size-pct-'+percent).onclick=()=> {
+    state.pctClicks.push(percent);
+    setTimeout(()=> {
+      el('size-input').value=String(percent/100*(el('size-unit-select').dataset.unit==='micro'?4:8));
+      document.querySelector('[data-testid="order-form"] [role="slider"]').setAttribute('aria-valuenow',state.behavior==='wrong-percentage'?'0':String(percent));
+    },100);
+  };
+  const send = (message) => new Promise((resolve, reject) => {
+    try { state.messageHandler(message, {}, resolve); } catch (error) { reject(error); }
+  });
+  const assert = (condition, message) => { if (!condition) throw new Error(message); };
+  async function setup(name, behavior = 'success', options = {}) {
+    document.querySelector('[data-testid="capital-indicator-drawdown"]')?.remove();
+    for (const dialog of document.querySelectorAll('[role="dialog"],[role="alertdialog"]')) dialog.remove();
+    emptyPosition(); state.behavior = behavior; state.results = []; state.nextJob = null;
+    state.orderClicks = 0; state.closeClicks = 0; state.closeConfirmClicks = 0;
+    state.pctClicks=[]; state.sizing=null;
+    el('size-unit-select').dataset.unit='token';el('size-unit-select').textContent='NQ';
+    el('tpsl-unit-usd').setAttribute('aria-selected','true');el('tpsl-unit-usd').dataset.state='active';
+    el('size-input').value='2'; document.querySelector('[data-testid="order-form"] [role="slider"]').setAttribute('aria-valuenow','0');
+    el('account-value').textContent = '$1,000.00'; el('account-upnl').textContent = '$0.00';
+    const config = { accountId: 'fixture-' + name, token: 'fixture-not-a-real-token', enabled: true, armed: true, acknowledged: true,
+      identityText: 'Fixture Unique Account Evaluation', unitText: 'NQ', selectors: { ...globalThis.VestBridgeCore.defaults }, ...options };
+    await mockChrome.storage.local.set({ 'tab:fixture': config });
+    await send({ type: 'configure', config: clone(config), tabKey: 'tab:fixture' });
+    return config;
+  }
+  async function deliver(config, change = {}) {
+    state.nextJob = { id: 'fixture-job-' + (++state.counter), account_id: config.accountId, type: 'open', symbol: 'NQ-PERP', side: 'buy', quantity: 2, take_profit: 100, stop_loss: 50, ...change };
+    await state.tick();
+    assert(state.results.length === 1, 'Expected exactly one local result');
+    return state.results[0];
+  }
+  globalThis.runStopRuleFixtureTests = async () => {
+    const cases=[];
+    const test=async(name,run)=>{try{await run();cases.push({name,passed:true});}catch(error){cases.push({name,passed:false,error:error.message});}};
+    const metric=(text='$801 / $1000')=>{
+      const el=document.createElement('p');el.dataset.testid='capital-indicator-drawdown';el.textContent=text;document.body.append(el);return el;
+    };
+    const rule={source:'strategy',size_percent:25,quantity:undefined,take_profit:null,stop_loss:130,
+      configured_stop_loss:130,skip_stop_loss_on_low_drawdown:true,drawdown_stop_loss_threshold:200};
+    for(const [remaining,stop] of [[199,null],[200,130],[201,130]]){
+      await test(`remaining ${remaining} uses stop ${stop}`,async()=>{
+        const config=await setup('drawdown-'+remaining);metric(`$${1000-remaining} / $1000`);
+        el('tpsl-input-sl').value='150';
+        const result=await deliver(config,rule);
+        assert(result.success && result.confirmed && state.orderClicks===1,'Policy opening was not confirmed: '+result.error);
+        assert(state.sizing.stop_loss===stop,'Incorrect stop was acknowledged');
+        assert(stop===null ? el('tpsl-input-sl').value==='' && result.snapshot.native_sl_absent : el('tpsl-input-sl').value==='130' && result.snapshot.native_sl,'Actual stop did not match decision');
+      });
+    }
+    for(const [name,behavior,text] of [['missing','success',null],['percentage','success','80%'],['sticky stop','sticky-sl','$801 / $1000'],
+      ['changed condition','drawdown-crossed','$801 / $1000'],['incorrect acknowledgment','wrong-stop-policy-ack','$801 / $1000']]){
+      await test(name+' prevents order click',async()=>{
+        const config=await setup('drawdown-'+name,behavior);if(text)metric(text);
+        const result=await deliver(config,rule);
+        assert(!result.success && state.orderClicks===0,'Unsafe policy decision clicked an order');
+      });
+    }
+    await test('disabled rule keeps configured stop without a metric',async()=>{
+      const config=await setup('drawdown-disabled');
+      const result=await deliver(config,{...rule,skip_stop_loss_on_low_drawdown:false});
+      assert(result.success && state.orderClicks===1 && result.snapshot.native_sl && el('tpsl-input-sl').value==='130','Disabled rule changed stop');
+    });
+    for(const behavior of ['unexpected-stop','missing-protection-cell']) {
+      await test(behavior+' cannot confirm an intentionally unprotected entry',async()=>{
+        const config=await setup('drawdown-'+behavior,behavior);metric();
+        const result=await deliver(config,rule);
+        assert(!result.success && state.orderClicks===1 && state.storage['tab:fixture'].armed===false,'Unknown protection was treated as no stop');
+        await state.tick();assert(state.orderClicks===1,'Unconfirmed opening was retried');
+      });
+    }
+    return{passed:cases.filter(item=>item.passed).length,failed:cases.filter(item=>!item.passed).length,total:cases.length,cases};
+  };
+  globalThis.runBridgeFixtureTests = async () => {
+    if (!globalThis.VestBridgeCore || !state.messageHandler || !state.tick) throw new Error('Inject extension/core.js and extension/content.js after writing the fixture');
+    if (location.pathname !== '/trade/NQ-PERP') throw new Error('First navigate to a loopback HTTP page; fixture must use /trade/NQ-PERP pathname');
+    const cases = [];
+    const test = async (name, run) => { try { await run(); cases.push({ name, passed: true }); } catch (error) { cases.push({ name, passed: false, error: error.message }); } };
+    await test('negative native currency snapshot keeps equity and cash balance distinct', async () => {
+      await setup('negative'); el('account-value').textContent = '$987.50'; el('account-upnl').textContent = '-$12.50';
+      const captured = await send({ type: 'capture' });
+      assert(captured.ok && captured.snapshot.equity === 987.5 && captured.snapshot.unrealized_pnl === -12.5 && captured.snapshot.balance === 1000, 'Signed native PnL or derived balance was incorrect');
+    });
+    await test('matching new position and native protection confirm one opening', async () => {
+      const config = await setup('success'); const result = await deliver(config);
+      assert(result.success && result.confirmed && state.orderClicks === 1, 'Matching opening was not confirmed exactly once');
+      assert(result.snapshot.position_id && result.snapshot.side === 'buy' && result.snapshot.quantity === 2 && result.snapshot.native_tpsl, 'Actual position fields or native TP/SL were not observed');
+      await state.tick(); assert(state.orderClicks === 1, 'Confirmed job was clicked twice');
+    });
+    await test('incorrect observed side pauses without repeating order', async () => {
+      const config = await setup('wrong-side', 'wrong-side'); const result = await deliver(config);
+      assert(!result.success && !result.confirmed && state.orderClicks === 1, 'Wrong-side fill was accepted');
+      assert(state.storage['tab:fixture'].armed === false, 'Wrong-side result did not disarm');
+      await state.tick(); assert(state.orderClicks === 1, 'Unknown result was automatically retried');
+    });
+    await test('partial or incorrect observed size cannot confirm an opening', async () => {
+      const config = await setup('wrong-quantity', 'wrong-quantity'); const result = await deliver(config);
+      assert(!result.success && !result.confirmed && state.storage['tab:fixture'].armed === false, 'Wrong-size fill was accepted');
+    });
+    await test('existing modal blocks all opening clicks', async () => {
+      const config = await setup('modal'); const modal = document.createElement('div'); modal.setAttribute('role', 'dialog'); modal.textContent = 'Fixture manual confirmation'; document.body.append(modal);
+      const result = await deliver(config); assert(!result.success && state.orderClicks === 0, 'Opening clicked behind a pre-existing modal'); modal.remove();
+    });
+    await test('same-id full close scopes duplicate controls to the close dialog', async () => {
+      const config = await setup('close'); showPosition({ id: 'close-position', side: 'buy', quantity: 2 });
+      const result = await deliver(config, { type: 'close', browser_position_id: 'close-position', position_id: 'close-position' });
+      assert(result.success && result.confirmed && result.snapshot.position_open === false, 'Full close did not confirm');
+      assert(state.closeClicks === 1 && state.closeConfirmClicks === 1 && state.orderClicks === 0, 'Close used incorrect controls or repeated the action');
+    });
+    await test('different position id prevents clicking a close button', async () => {
+      const config = await setup('wrong-close-id'); showPosition({ id: 'actual-position', side: 'buy', quantity: 2 });
+      const result = await deliver(config, { type: 'close', browser_position_id: 'other-position', position_id: 'other-position' });
+      assert(!result.success && state.closeClicks === 0 && state.closeConfirmClicks === 0, 'Wrong-position close was attempted');
+    });
+    await test('all four position-size presets use the page calculation and pin it before opening', async () => {
+      for (const percent of [25,50,75,100]) {
+        const config=await setup('percent-'+percent);
+        const result=await deliver(config,{size_percent:percent,quantity:undefined});
+        assert(result.success && result.confirmed && state.orderClicks===1,'Preset failed '+percent);
+        assert(state.pctClicks.length===1 && state.pctClicks[0]===percent,'Incorrect preset button');
+        assert(state.sizing.quantity===percent/100*8 && result.snapshot.quantity===state.sizing.quantity,'Page-derived quantity was not preserved');
+      }
+    });
+    await test('unconfirmed preset selection never opens an order', async () => {
+      const config=await setup('wrong-percentage','wrong-percentage');
+      const result=await deliver(config,{size_percent:50,quantity:undefined});
+      assert(!result.success && state.orderClicks===0 && !state.sizing,'Unconfirmed preset was accepted');
+    });
+    await test('a declined sizing acknowledgment prevents the opening click', async () => {
+      const config=await setup('size-rejected','size-rejected');
+      const result=await deliver(config,{size_percent:75,quantity:undefined});
+      assert(!result.success && state.orderClicks===0 && state.sizing.quantity===6,'Declined sizing was submitted');
+    });
+    await test('percentage sizing still refuses an incorrect actual filled quantity', async () => {
+      const config=await setup('percent-wrong-fill','wrong-quantity');
+      const result=await deliver(config,{size_percent:100,quantity:undefined});
+      assert(!result.success && !result.confirmed && state.orderClicks===1 && state.sizing.quantity===8,'Incorrect percentage fill was confirmed');
+    });
+    await test('no take profit clears a previous TP and confirms native stop loss alone', async () => {
+      const config=await setup('stop-only'); el('tpsl-input-tp').value='150';
+      const result=await deliver(config,{take_profit:null,stop_loss:130});
+      assert(result.success && result.confirmed && state.orderClicks===1,'Stop-only opening was not confirmed');
+      assert(el('tpsl-input-tp').value==='' && el('tpsl-input-sl').value==='130','Old TP remained or default stop was wrong');
+      assert(result.snapshot.native_sl && result.snapshot.native_tp_price===null,'Native stop-only protection missing');
+    });
+    await test('a page refusing to clear an old TP prevents opening', async () => {
+      const config=await setup('sticky-tp','sticky-tp');
+      const result=await deliver(config,{take_profit:null,stop_loss:130});
+      assert(!result.success && state.orderClicks===0,'Old TP was submitted against the request');
+    });
+    await test('stop-only orders still require visible native stop protection before confirmation', async () => {
+      const config=await setup('missing-stop','missing-stop');
+      const result=await deliver(config,{take_profit:null,stop_loss:130});
+      assert(!result.success && !result.confirmed && state.orderClicks===1,'Unprotected fill was confirmed');
+    });
+    await test('an existing position closes with exact identity even when the opening form is removed', async () => {
+      const config=await setup('close-without-opening-form');
+      showPosition({id:'passed-open-position',quantity:2});
+      const form=document.querySelector('[data-testid="order-form"]'); form.remove();
+      try {
+        const result=await deliver(config,{type:'close',browser_position_id:'passed-open-position',position_id:'passed-open-position'});
+        assert(result.success && result.confirmed && state.closeClicks===1 && state.closeConfirmClicks===1,'Closing incorrectly depended on an opening form');
+      } finally {document.body.append(form);}
+    });
+    await test('a primary account cannot open or fill order inputs even with a delivered job', async () => {
+      const config=await setup('main-open');
+      const trigger=el('account-selector-trigger'); const original=trigger.innerHTML;
+      trigger.innerHTML='<span class="truncate">主账户</span>';
+      const before=[el('size-input').value,el('tpsl-input-tp').value,el('tpsl-input-sl').value].join('|');
+      try {
+        const result=await deliver(config);
+        assert(!result.success && result.error.includes('永久排除') && state.orderClicks===0,'Main account opened');
+        assert(before===[el('size-input').value,el('tpsl-input-tp').value,el('tpsl-input-sl').value].join('|'),'Main account inputs changed');
+      } finally { trigger.innerHTML=original; }
+    });
+    await test('a default account cannot close even if a stale config claims an evaluation account', async () => {
+      const config=await setup('main-close'); showPosition({id:'main-native-position',quantity:2});
+      const trigger=el('account-selector-trigger'); const original=trigger.innerHTML;
+      trigger.innerHTML='<span class="truncate">Wallet</span><span>Default</span>';
+      try {
+        const result=await deliver(config,{type:'close',browser_position_id:'main-native-position',position_id:'main-native-position'});
+        assert(!result.success && result.error.includes('永久排除') && state.closeClicks===0 && state.closeConfirmClicks===0,'Main account close attempted');
+      } finally { trigger.innerHTML=original; }
+    });
+    await test('Radix-style mousedown selects USD and Micro before an exact-quantity opening', async () => {
+      const config=await setup('auto-usd-micro','success',{inputUnit:'micro',unitText:null});
+      const usd=el('tpsl-unit-usd');usd.setAttribute('aria-selected','false');usd.dataset.state='inactive';
+      const select=()=>setTimeout(()=>{usd.setAttribute('aria-selected','true');usd.dataset.state='active';},250);
+      usd.addEventListener('mousedown',select);
+      try {
+        assert(!(await send({type:'inspect'})).ok,'Inactive USD was incorrectly ready');
+        const prepared=await send({type:'prepare'});
+        assert(prepared.ok&&el('size-unit-select').dataset.unit==='micro'&&usd.getAttribute('aria-selected')==='true','Automatic USD / Micro setup failed');
+        const result=await deliver(config,{quantity:6,take_profit:null,stop_loss:250});
+        assert(result.success&&state.orderClicks===1&&result.snapshot.quantity===6&&el('size-input').value==='3','3 Micro did not correspond to exactly 6 Vest units');
+      } finally {usd.removeEventListener('mousedown',select);}
+    });
+    await test('Micro percentage sizing pins canonical quantity and still verifies the actual fill', async () => {
+      const config=await setup('micro-percent','success',{inputUnit:'micro',unitText:null});
+      assert((await send({type:'prepare'})).ok,'Micro preparation failed');
+      const result=await deliver(config,{size_percent:75,quantity:undefined,take_profit:null,stop_loss:250});
+      assert(result.success&&state.sizing.quantity===6&&result.snapshot.quantity===6&&el('size-input').value==='3','Percentage sizing mixed Micro input and Vest execution units');
+    });
+    await test('failure to select USD stops before submitting or editing order amounts', async () => {
+      await setup('usd-rejected');const usd=el('tpsl-unit-usd');usd.setAttribute('aria-selected','false');usd.dataset.state='inactive';
+      const before=el('tpsl-input-sl').value;
+      const prepared=await send({type:'prepare'});
+      assert(!prepared.ok&&prepared.error.includes('无法确认页面标签')&&state.orderClicks===0&&el('tpsl-input-sl').value===before,'Unconfirmed USD was bypassed');
+    });
+    await test('Micro close still matches canonical position quantity and confirms a full close exactly once', async () => {
+      const config=await setup('micro-close','success',{inputUnit:'micro',unitText:null});
+      assert((await send({type:'prepare'})).ok,'Micro preparation failed');
+      showPosition({id:'micro-close-position',quantity:6});
+      const result=await deliver(config,{type:'close',quantity:6,position_id:'micro-close-position',browser_position_id:'micro-close-position'});
+      assert(result.success&&result.snapshot.position_open===false&&state.closeClicks===1&&state.closeConfirmClicks===1&&state.orderClicks===0,'Micro full close changed quantity or repeated the execution');
+    });
+    await test('native NDX market link confirms the NQ fill and a foreign market never does', async () => {
+      const config=await setup('native-market-alias','native-ndx-link');
+      const result=await deliver(config,{take_profit:null,stop_loss:250});
+      assert(result.success&&result.snapshot.symbol==='NQ-PERP','Native NDX alias left a real fill unconfirmed');
+      document.querySelector('[data-testid^="position-symbol-"]').closest('a').href='https://next.vestmarkets.com/trade/ES-PERP';
+      assert(!(await send({type:'inspect'})).ok,'Foreign market link bypassed the guard');
+    });
+    const result = { passed: cases.filter((item) => item.passed).length, failed: cases.filter((item) => !item.passed).length, total: cases.length, cases };
+    document.getElementById('fixture-result').textContent = JSON.stringify(result, null, 2);
+    return result;
+  };
+})();
+</script>
+</body></html>

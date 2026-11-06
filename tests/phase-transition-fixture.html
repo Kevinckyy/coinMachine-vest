@@ -1,0 +1,55 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Isolated account phase fixture</title></head><body>
+<button data-testid="account-selector-trigger" aria-expanded="false"><span class="truncate">Phase Alpha</span><span>Evaluation</span></button>
+<p data-testid="account-value">$5,000.00</p><p data-testid="book-mark">$100.00</p>
+<button data-testid="account-tab-active-positions" aria-selected="true" data-state="active" aria-controls="positions">Active Positions</button>
+<div id="positions" role="tabpanel"><p>No positions yet</p></div>
+<div class="sticky top-14"><span id="phase-badge" data-slot="badge">第 1/2 阶段</span><p data-testid="capital-indicator-goal">$10.00 / $500.00</p><p>未实现盈亏： <span>$0.00</span></p></div>
+<script>
+(()=>{
+  const state={handler:null,timer:null,messages:[],menuOpens:0};
+  const account={id:'fixture-phase',name:'Phase Alpha',category:'eval',identity:'eval:Phase Alpha',phase:'1/2',auto_discovered:true,balance:5000,equity:5000,unrealized_pnl:0,current:true,observed_at:Date.now()/1000};
+  const copy=value=>structuredClone(value);
+  const reply=extra=>({ok:true,data:{mode:'execute',mode_epoch:1,accounts:[copy(account)],...extra}});
+  document.querySelector('[data-testid="account-selector-trigger"]').onclick=()=>{state.menuOpens++;throw new Error('A phase change must not open the selector');};
+  globalThis.setInterval=callback=>{state.timer=callback;return 1;};
+  Object.defineProperty(globalThis,'chrome',{configurable:true,value:{runtime:{id:'fixture-phase-extension',onMessage:{addListener:fn=>{state.handler=fn;}},sendMessage:async message=>{
+    state.messages.push(copy(message));
+    if(message.type==='observation-restore')return{ok:true,data:{enabled:true,accounts:[copy(account)],mode_epoch:0}};
+    if(message.type==='mode-heartbeat')return reply({});
+    if(message.type==='execution-next')return reply({next_account:{...copy(account),operation:'monitor'}});
+    if(message.type==='observe'){
+      const observed=message.accounts.find(a=>a.name===account.name);
+      if(observed?.phase && observed.phase!==account.phase){
+        if(observed.phase_snapshot?.phase!==observed.phase || observed.phase_snapshot?.position_open!==false)throw new Error('Missing new-phase flat proof');
+        Object.assign(account,copy(observed));
+        account.identity=account.category+':'+account.name;
+      }
+      return reply({});
+    }
+    if(message.type==='poll'){
+      if(message.phase!==account.phase || message.snapshot.phase!==account.phase)throw new Error('A stale-phase poll escaped');
+      return reply({job:null});
+    }
+    if(message.type==='execution-failed')throw new Error('Unexpected global read-only switch');
+    throw new Error('Unexpected trading message: '+message.type);
+  }},storage:{local:{get:async()=>({}),set:async()=>{}},onChanged:{addListener:()=>{}}}}});
+  history.replaceState(null,'','/trade/NQ-PERP');
+  const send=message=>new Promise(resolve=>state.handler(message,{},resolve));
+  const assert=(value,message)=>{if(!value)throw new Error(message);};
+  globalThis.runPhaseTransitionFixtureTests=async()=>{
+    await new Promise(resolve=>setTimeout(resolve,20));
+    assert((await send({type:'control-mode',mode:'execute',mode_epoch:1,session_id:'fixture-phase-session',accounts:[copy(account)]})).ok,'Enable fixture mode');
+    for(const [label,phase] of [['第 1/2 阶段','1/2'],['第 2/2 阶段','2/2'],['Live','live']]){
+      document.getElementById('phase-badge').textContent=label;
+      await state.timer();
+      assert(account.phase===phase,'Account phase did not advance to '+phase);
+      const poll=state.messages.filter(m=>m.type==='poll').at(-1);
+      assert(poll?.phase===phase&&poll.snapshot.phase===phase,'Current phase was not polled');
+      assert(!state.messages.some(m=>m.type==='execution-failed'),'Phase change revoked execution');
+    }
+    assert(state.menuOpens===0,'Phase monitoring opened the selector');
+    assert(!state.messages.some(m=>['size','result','execution-failed'].includes(m.type)),'Phase monitoring entered trading execution');
+    return{ok:true,checks:['1/2 → 2/2 → live','new phase flat snapshots','matching phase on poll','no trading actions','no selector opens','execute permission retained']};
+  };
+})();
+</script></body></html>
