@@ -4,12 +4,14 @@ import heapq
 import json
 import math
 import time
+from collections import deque
 
 from .backtesting import PHASES,RULE_SOURCES,ny_day,validate_config
 from .backtest_runtime import UnusedAccounts,DetailPreview
 from .engine import ValidationError
 from .strategies import require_strategy,choose_batch,choose_side
 from .backtest_random import create_stream
+from .backtest_expectancy import account_value,populate_metrics
 
 
 def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
@@ -26,13 +28,25 @@ def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
     # position sizing independent of quantity-dependent price impact.
     fixed_slippage=c['slippage_usd'] if c['slippage_mode']=='usd' else 0.
     active={};positions={};ready=[];ready_index={};pending=[];details=DetailPreview(detail_sink)
-    totals=dict(trades=0,wins=0,pnl=0.,fees=0.,fixed_slippage=0.,funding=0.,paid=0.,pending=0.,paid_accounts=0,failed=0,passed=0,funded=0,skipped=0,created=0,claims=0)
+    pool_counts={'exam':0,'live':0};pool_peaks={'exam':0,'live':0};waiting_live=deque()
+    def room(kind):
+        limit=c[kind+'_pool_limit'] if c['pool_limits_enabled'] else 'infinity'
+        return math.inf if limit=='infinity' else max(0,limit-pool_counts[kind])
+
+    def occupy(kind,change):
+        pool_counts[kind]+=change;pool_peaks[kind]=max(pool_peaks[kind],pool_counts[kind])
+    totals=dict(trades=0,wins=0,pnl=0.,fees=0.,fixed_slippage=0.,funding=0.,paid=0.,pending=0.,paid_accounts=0,failed=0,passed=0,funded=0,skipped=0,created=0,claims=0,remaining_expectancy=0.)
     stages={phase:dict(accounts=0,passed=0,failed=0,trades=0,closed=0,holding=0.,pnl=0.) for phase in PHASES}
     if not unlimited:stages[c['initial_phase']]['accounts']=c['account_count']
     if not unlimited and initial_phase==2:totals['funded']=c['account_count']
     curve=[];batch=[];queue=[];next_order=bars[0]['time'];next_batch=next_order;last_day=None;last_progress=time.monotonic()
 
     def phase_record(now):return dict(entered_at=now,trades=0,closed=0,holding=0,pnl=0,passed=False)
+
+    def refresh_expectancy(a):
+        value=account_value(c,PHASES[a['phase']],a['balance'],a['status'])
+        totals['remaining_expectancy']+=value-a.get('_remaining_expectancy',0.)
+        a['_remaining_expectancy']=value
 
     def account_row(a):
         return dict(id=a['id'],phase=PHASES[a['phase']],status=a['status'],balance=round(a['balance'],4),
@@ -43,7 +57,8 @@ def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
     def create(aid,now):
         a=dict(id=aid,phase=initial_phase,balance=capital,status='active',position=None,pnl=0.,paid=0.,pending=0.,
             last_entry={},used=set(),lock_day=None,risk_day=None,daily_floor=None,phase_records={c['initial_phase']:phase_record(now)})
-        active[aid]=a;totals['created']+=1
+        active[aid]=a;totals['created']+=1;refresh_expectancy(a)
+        occupy('live' if initial_phase==2 else 'exam',1)
         if unlimited:stages[c['initial_phase']]['accounts']+=1
         if initial_phase==2 and unlimited:totals['funded']+=1
         return a
@@ -63,7 +78,15 @@ def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
     def retire(a):
         if a['status']=='active' and not c['repeat_daily'] and not a['position'] and a['phase'] in a['used']:
             a['status']='exhausted'
-        if a['status']!='active':active.pop(a['id'],None)
+        if a['status'] not in ('active','waiting_live'):active.pop(a['id'],None)
+
+    def enter_live(a,now):
+        occupy('exam',-1);occupy('live',1);a['phase']=2;a['status']='active'
+        a['phase_records']['live']=phase_record(now);stages['live']['accounts']+=1;totals['funded']+=1
+        refresh_expectancy(a);offer(a,ny_day(now,c['strategy_reset_hour']));record_account(a)
+
+    def admit_waiting(now):
+        while waiting_live and room('live')>0:enter_live(waiting_live.popleft(),now)
 
     def reset_risk(a,risk_day):
         if a['risk_day']!=risk_day:
@@ -97,13 +120,18 @@ def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
         floor=max(capital-c['max_drawdown'],a['daily_floor'] if a['daily_floor'] is not None else -math.inf)
         if reason in ('max_drawdown','daily_loss') or a['balance']<floor-1e-8:
             a['status']='failed';record.update(ended_at=ts,outcome='failed');stage['failed']+=1;totals['failed']+=1
+            occupy('live' if a['phase']==2 else 'exam',-1)
         else:
             goal=c['phase1_goal'] if a['phase']==0 else c['phase2_goal'] if a['phase']==1 else None
             if goal is not None and a['balance']>=capital+goal-1e-6:
-                record.update(passed=True,ended_at=ts,outcome='passed');stage['passed']+=1;a['phase']+=1
+                record.update(passed=True,ended_at=ts,outcome='passed');stage['passed']+=1
                 a.update(balance=capital,risk_day=None,daily_floor=None,lock_day=None)
-                phase=PHASES[a['phase']];a['phase_records'][phase]=phase_record(ts);stages[phase]['accounts']+=1
-                if a['phase']==2:totals['passed']+=1;totals['funded']+=1
+                if a['phase']==1:
+                    totals['passed']+=1
+                    if room('live')>0 and not waiting_live:enter_live(a,ts)
+                    else:a['status']='waiting_live';waiting_live.append(a)
+                else:
+                    a['phase']=1;a['phase_records']['2/2']=phase_record(ts);stages['2/2']['accounts']+=1
             elif a['phase']==2 and a['balance']-capital>=c['payout_min_profit']:
                 gross_claim=a['balance']-capital;amount=round(gross_claim*c['profit_split_percent']/100,8)
                 a['balance']-=gross_claim
@@ -112,7 +140,7 @@ def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
                 claim=dict(id=totals['claims'],account_id=a['id'],phase='live',requested_at=ts,credit_at=ts+c['payout_delay_hours']*3600,
                     gross_profit=round(gross_claim,8),amount=amount,status='pending')
                 heapq.heappush(pending,(claim['credit_at'],claim['id'],a,claim));details.record('claims',claim)
-        retire(a);offer(a,ny_day(ts,c['strategy_reset_hour']));record_account(a)
+        refresh_expectancy(a);retire(a);offer(a,ny_day(ts,c['strategy_reset_hour']));record_account(a)
 
     def target_price(a,p,goal):
         q=p['quantity']*pv;d=p['direction'];needed=capital+goal-a['balance']+fixed_slippage
@@ -123,6 +151,7 @@ def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
 
     for index,b in enumerate(bars):
         now=b['time'];paid_through(now);day=ny_day(now,c['strategy_reset_hour']);risk_day=ny_day(now,c['risk_reset_hour'])
+        admit_waiting(now)
         if day!=last_day:
             ready.clear();ready_index.clear();queued={a['id'] for a in queue}
             for a in active.values():
@@ -133,18 +162,31 @@ def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
             batch=[];next_batch=now+rng.uniform(c['batch_delay_min'],c['batch_delay_max'])
         if not batch and now>=next_batch:
             if unlimited:
-                for _ in range(max(0,c['batch_size']-len(ready))):
+                fresh_count=int(min(max(0,c['batch_size']-len(ready)),room('live' if initial_phase==2 else 'exam')))
+                for _ in range(fresh_count):
                     a=create(totals['created']+1,now);offer(a,day)
-            available=unused.remaining+len(ready)
-            if available>=c['batch_size']:
-                chosen=choose_batch(c['strategy_id'],rng,range(available),c['batch_size']);fresh=[];old=[];batch=[]
+            fresh_available=int(min(unused.remaining,room('live' if initial_phase==2 else 'exam')))
+            available=fresh_available+len(ready)
+            size=min(available,c['batch_size']) if c['pool_limits_enabled'] else c['batch_size']
+            if available>=size and size>0:
+                live_indices=[j for j,aid in enumerate(ready) if active[aid]['phase']==2]
+                if live_indices and initial_phase!=2:
+                    live_chosen=choose_batch(c['strategy_id'],rng,live_indices,min(size,len(live_indices)))
+                    exam_indices=[j for j,aid in enumerate(ready) if active[aid]['phase']!=2]
+                    extra=choose_batch(c['strategy_id'],rng,range(fresh_available+len(exam_indices)),size-len(live_chosen))
+                    chosen=[fresh_available+j for j in live_chosen]+[i if i<fresh_available else fresh_available+exam_indices[i-fresh_available] for i in extra]
+                else:chosen=choose_batch(c['strategy_id'],rng,range(available),size)
+                # Capped fresh slots still draw IDs from the entire lazy pool.
+                fresh_slots=[i for i in chosen if i<fresh_available]
+                fresh_ids=dict(zip(fresh_slots,choose_batch(c['strategy_id'],rng,range(unused.remaining),len(fresh_slots)))) if fresh_available<unused.remaining else {i:i for i in fresh_slots}
+                fresh=[];old=[];batch=[]
                 for i in chosen:
-                    if i<unused.remaining:
-                        a=create(unused.value(i),now);fresh.append(i)
+                    if i<fresh_available:
+                        j=fresh_ids[i];a=create(unused.value(j),now);fresh.append(j)
                     else:
-                        j=i-unused.remaining;a=active[ready[j]];old.append(j)
+                        j=i-fresh_available;a=active[ready[j]];old.append(j)
                     batch.append(a)
-                unused.discard(fresh);remove_ready(old);queue=list(batch);next_order=now
+                unused.discard(fresh);remove_ready(old);queue=sorted(batch,key=lambda a:0 if a['phase']==2 else 1);next_order=now
         while queue and now>=next_order:
             a=queue.pop(0);reset_risk(a,risk_day)
             direction=1 if choose_side(c['strategy_id'],rng,c['side'])=='buy' else -1;entry=fill(b['open'],direction)
@@ -220,11 +262,12 @@ def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
         pending_payout_at_cutoff=round(pending_at_cutoff,4),settled_after_cutoff=round(totals['paid']-payout_at_cutoff,4),
         account_purchase_cost=c['account_fee']*count,net_cash=round(totals['paid']-c['account_fee']*count,4),skipped_insufficient_margin=totals['skipped'],
         total_accounts=count,started_accounts=totals['created'],unstarted_accounts=unused.remaining,
+        exam_pool_peak=pool_peaks['exam'],live_pool_peak=pool_peaks['live'],exam_pool_at_cutoff=pool_counts['exam'],live_pool_at_cutoff=pool_counts['live'],waiting_live_accounts=len(waiting_live),
         avg_trades_per_account=totals['trades']/count if count else None,
         total_holding_seconds=sum(r['holding'] for r in stages.values()),closed_trades=totals['trades'],
         avg_holding_seconds=sum(r['holding'] for r in stages.values())/totals['trades'] if totals['trades'] else None)
     progress(dict(completed=len(bars),total=len(bars),trades=totals['trades'],accounts=totals['created'],active_positions=0))
-    return dict(config=c,simulation_version=6,strategy_version=require_strategy(c['strategy_id'])['version'],metrics=metrics,stages=stage_metrics,curve=curve,
+    result=dict(config=c,simulation_version=8,strategy_version=require_strategy(c['strategy_id'])['version'],metrics=metrics,stages=stage_metrics,curve=curve,
         randomness=dict(algorithm=c['rng_algorithm'],seed=c['seed'],seed_policy=c['seed_policy'],
             seed_bits=128 if isinstance(c['seed'],str) else 32,sampler_version=1,library_version=getattr(rng,'library_version',None)),
         settlement=dict(policy='settle_submitted_claims',trading_end=end,settlement_end=settlement_end,
@@ -242,9 +285,12 @@ def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
             'tick 滑点体现在成交价格；USD 滑点按整笔订单每边固定金额单独扣减，开仓预留，平仓及达标计算包含该成本，不随数量放大。',
             '同根K线同时触及止损/风控与盈利目标时先处理不利退出；已知开盘先于高低点，跳空止损按更差开盘价处理。',
             '秒级随机间隔向下一根K线开盘取整；阶段达标按扣除离场费用后的净值确认。',
-            '每日重复为可选调度；关闭后同账户每阶段仅一次。开仓额度/风控按 17:00/20:00 ET。∞ 模式仅在不足一批时补充新号，持续到数据结束。',
+            f"每日重复为可选调度；关闭后同账户每阶段仅一次。开仓额度/风控按 {c['strategy_reset_hour']:02}:00/{c['risk_reset_hour']:02}:00 ET。∞ 模式仅在不足一批时补充新号，持续到数据结束。",
             'live 出金目标是模拟平仓条件，非平台强制目标；空仓后扣除全部申请利润，分润份额延迟到账，已申请分润按设定延迟结算。',
             '截止后停止交易，仅将已申请分润按原到账时间全部结算；最终出金、出金率和现金曲线包含结算尾段，不等同链上提现。',
             '出金率和单号平均出金以固定池全部账户为分母（包含未参与），∞ 模式以实际生成账户为分母。',
             '各阶段平均单数以进入该阶段的账户为分母，固定池初始阶段包含全部计划账户；持仓时间以已平仓笔数为分母，期末按最后收盘价结算。',
             '资金费采用固定每小时假设、默认 0；详细记录分批写入本地，结果预览最多各 500 条，完整明细可分页查询。'])
+    result['assumptions'].append('Live 号优先选批并先下单；开启账号池限制时按存活号计数，失败释放名额，二阶段通过但 Live 池满的号保留资格、等待空位，不再交易；允许不足一批执行。未启用计划号不占存活池位。')
+    remaining=max(0.,totals['remaining_expectancy'])+unused.remaining*account_value(c,c['initial_phase'],capital)
+    return populate_metrics(result,remaining)

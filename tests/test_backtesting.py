@@ -348,7 +348,7 @@ class ServiceTests(unittest.TestCase):
             meta=service.metadata(state)
             self.assertEqual(meta['defaults']['initial_capital'],5000)
             self.assertEqual(meta['defaults']['risk_reset_hour'],20)
-            self.assertEqual(meta['defaults']['strategy_reset_hour'],17)
+            self.assertEqual(meta['defaults']['strategy_reset_hour'],20)
             self.assertEqual(meta['defaults']['profit_split_percent'],80)
             q=service.observe_costs(dict(symbol='NQ-PERP',fee_bps=.25,slippage_bps=1.2,observed_at=time.time(),notional=50000,source_text='Fee / Slippage'))
             self.assertEqual(q['quote']['source'],'vest-order-form')

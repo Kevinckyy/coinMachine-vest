@@ -18,6 +18,11 @@ export async function runBacktestChecks({base,run,command,evaluate,clickText,unt
   await until(()=>evaluate(`document.querySelector(\'.backtest-page\') && document.querySelectorAll(\'.backtest-cache-list strong\').length===4`),'backtest page and four cached native contracts');
   assert.equal(await field('回测品种'),'MNQ');
   assert.equal(await field('回测自动策略'),'random_entry');
+  assert.equal(await field('回测开仓额度日切（美东时）'),'20');
+  assert.equal(await field('回测风控日切（美东时）'),'20');
+  assert.equal(await evaluate(`document.querySelector('[aria-label="回测账号池限制"]').checked`),false);
+  assert.equal(await evaluate(`document.querySelector('[aria-label="考试号上限 m不限"]').checked`),true);
+  assert.equal(await field('回测Live号上限 n'),'10');
   assert.equal(await evaluate(`document.querySelector('[aria-label="回测随机种子"]')===null`),true);
   assert.ok(await evaluate(`document.querySelector('[aria-label="回测随机规则"]').textContent.includes('PCG64DXSM')`));
   assert.equal(await field('回测每笔每边滑点 USD'),'0.4');
@@ -39,6 +44,8 @@ export async function runBacktestChecks({base,run,command,evaluate,clickText,unt
     assert.equal((await (await fetch(base+'/api/backtests/meta')).json()).jobs.length,jobsBeforeInvalid,'invalid parameters never create a backend task');
   }
   await edit({'回测模拟账户数':4,'回测每批账户数':2,'回测第一阶段目标':10,'回测第二阶段目标':6,
+    '回测开仓额度日切（美东时）':18,'回测风控日切（美东时）':19,
+    '回测记录自定义名称':'历史测试初名',
     '回测live 出金平仓目标':4,'回测分润到账延迟小时':48,'回测下单最小间隔秒':0,'回测下单最大间隔秒':0,
     '回测批次最小间隔秒':0,'回测批次最大间隔秒':0});
   await page(()=>{
@@ -70,10 +77,15 @@ export async function runBacktestChecks({base,run,command,evaluate,clickText,unt
   await page(()=>document.querySelector('[aria-label="资金曲线含手续费"]').click());
   const runs=await (await fetch(base+'/api/backtests/runs')).json();
   assert.equal(runs.runs.length,1);
+  assert.equal(runs.runs[0].config.strategy_reset_hour,18);
+  assert.equal(runs.runs[0].config.risk_reset_hour,19);
   await command('Page.navigate',{url:base+'/#backtest'});
   await until(()=>evaluate(`document.querySelectorAll('.backtest-batch-averages strong').length===9`),'summary restores after reload');
   assert.match((await (await fetch(base+'/api/backtests/meta')).json()).saved_form.seed,/^0x[0-9a-f]{32}$/);
   assert.equal(await field('回测每笔每边滑点 USD'),'0.4');
+  assert.equal(await field('回测开仓额度日切（美东时）'),'18');
+  assert.equal(await field('回测风控日切（美东时）'),'19');
+  await edit({'回测开仓额度日切（美东时）':20,'回测风控日切（美东时）':20});
   await edit({'回测模拟账户数':10000});
   await clickText('使用本地K线开始回测');
   await until(async()=> (await (await fetch(base+'/api/backtests/runs')).json()).runs.length===2,'10000-account result saved');
@@ -82,7 +94,10 @@ export async function runBacktestChecks({base,run,command,evaluate,clickText,unt
   let summary=await (await fetch(base+'/api/backtests/batches/'+latest.id+'?summary_only=1')).json();
   assert.equal(summary.summary.trading.total_accounts,10000);assert.deepEqual(summary.rows,[]);
   await page(()=>document.querySelector('[aria-label="回测无限账户"]').click());
+  await page(()=>{document.querySelector('[aria-label="回测账号池限制"]').click();document.querySelector('[aria-label="考试号上限 m不限"]').click();});
+  await edit({'回测考试号上限 m':3,'回测Live号上限 n':1});
   await edit({'回测测试轮数':3,'回测并行任务数':2,'回测杠杆':49});
+  await edit({'回测记录自定义名称':'池限制对照'});
   const beforeTiming=(await (await fetch(base+'/api/backtests/runs')).json()).runs.length;
   await clickText('测量单轮耗时');
   await until(()=>evaluate(`[...document.querySelectorAll('.backtest-time-estimate strong')].every(e=>e.textContent!=='—')`),'duration estimates');
@@ -100,6 +115,15 @@ export async function runBacktestChecks({base,run,command,evaluate,clickText,unt
   assert.equal(summary.summary.cash_curves.with_fees.rounds,3);
   assert.equal(summary.summary.cash_curves.without_fees.rounds,3);
   assert.equal(summary.summary.metrics.pending_payout.mean,0);
+  assert.ok(summary.summary.metrics.exam_pool_peak.max<=3);
+  assert.ok(summary.summary.metrics.live_pool_peak.max<=1);
+  assert.equal(summary.summary.expectancy.incomplete_rounds,0);
+  const split=summary.summary.metrics;
+  const cashAverage=split.avg_credited_payout_per_account.mean+split.avg_pending_payout_per_account.mean;
+  assert.ok(Math.abs(cashAverage-split.avg_payout_per_account.mean)<0.0001);
+  const shown=await evaluate(`document.querySelector('[aria-label="统计单号平均期望"]').textContent`);
+  assert.equal(shown,[split.avg_credited_payout_per_account.mean,split.avg_pending_payout_per_account.mean].map(v=>v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})).join(' + ')+' (+'+split.avg_remaining_expectancy_per_account.mean.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})+')');
+  assert.ok(await evaluate(`!!document.querySelector('[aria-label="账号池汇总"]')`));
   assert.ok(summary.summary.metrics.settled_after_cutoff.mean>0);
   assert.ok(summary.summary.settlement.settlement_end>summary.summary.settlement.trading_end);
   assert.ok(await evaluate(`document.querySelector('.backtest-batch').textContent.includes('截止后停止交易')`));
@@ -118,16 +142,56 @@ export async function runBacktestChecks({base,run,command,evaluate,clickText,unt
   await command('Page.navigate',{url:base+'/#backtest'});
   await until(()=>evaluate(`document.querySelector('.backtest-batch')?.textContent.includes('已完成 3 / 3 轮')`),'batch statistics persist');
   assert.equal(await field('回测测试轮数'),'3');
+  assert.equal(await field('回测考试号上限 m'),'3');
+  assert.equal(await field('回测Live号上限 n'),'1');
+  assert.equal(await evaluate(`document.querySelector('[aria-label="回测账号池限制"]').checked`),true);
   await edit({'回测测试轮数':1000});
   await until(()=>evaluate(`document.querySelector('.backtest-plan button.primary')?.textContent.includes('1,000') && document.querySelector('.backtest-plan button.primary')?.disabled===false`),'edited round count rendered and ready');
   await clickText('开始 1,000 轮随机种子回测');await clickText('停止本次测试');
   await until(()=>evaluate(`document.querySelector('.backtest-job')?.textContent.includes('已停止')`),'cancellation completes');
   const after=await state();assert.deepEqual(after.positions,before.positions);assert.equal(after.strategy.status,before.strategy.status);assert.deepEqual(after.bridge.jobs,before.bridge.jobs);
+  await clickText('回测历史','aside button');
+  await until(()=>evaluate(`document.querySelector('.history-record-list')?.getAttribute('aria-busy')==='false' && document.querySelectorAll('.history-record').length>=3`),'history management page');
+  assert.equal(await evaluate(`document.querySelector('.topbar .mode-switch button').disabled`),true);
+  const choose=async(label,value)=>page(({label,value})=>{const el=document.querySelector('[aria-label='+CSS.escape(label)+']');Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(el,value);el.dispatchEvent(new Event('change',{bubbles:true}));},{label,value});
+  const filter=async()=>{await clickText('筛选','button[type=submit]');await until(()=>evaluate(`document.querySelector('.history-record-list')?.getAttribute('aria-busy')==='false'`),'history query completes');};
+  await choose('历史品种','MES');await filter();assert.equal(await evaluate(`document.querySelectorAll('.history-record').length`),0);
+  await choose('历史品种','MNQ');await choose('历史策略','random_entry');
+  const fullName=summary.name,escapedName=fullName.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  await edit({'历史名称正则':'^'+escapedName+'$'});await filter();assert.equal(await evaluate(`document.querySelectorAll('.history-record').length`),1);
+  await edit({'历史开始时间':'2099-01-01T00:00'});await filter();assert.equal(await evaluate(`document.querySelectorAll('.history-record').length`),0);
+  await edit({'历史开始时间':''});await choose('历史时间口径','data');
+  const dateValue=t=>new Date(t*1000+8*3600000).toISOString().slice(0,16);
+  await edit({'历史开始时间':dateValue(summary.config.from),'历史结束时间':dateValue(summary.config.to)});await filter();
+  assert.equal(await evaluate(`document.querySelectorAll('.history-record').length`),1);
+  await edit({'历史名称正则':'['});await filter();assert.ok(await evaluate(`document.querySelector('.history-filter-panel [role=alert]')?.textContent.includes('名称正则无效')`));
+  await edit({'历史名称正则':'^'+escapedName+'$'});await filter();
+  await page(id=>document.querySelector('[data-record-id="'+id+'"]').click(),latest.id);
+  await until(()=>evaluate(`document.querySelectorAll('.history-detail .backtest-batch-averages strong').length===9 && !!document.querySelector('.history-parameters dl')`),'saved summary and full parameter snapshot');
+  await clickText('刷新','.history-filter-panel button');
+  await until(()=>evaluate(`document.querySelectorAll('.history-detail .backtest-batch-averages strong').length===9 && document.querySelector('.history-record-list').getAttribute('aria-busy')==='false'`),'refresh updates selected detail too');
+  assert.equal(await field('历史记录自定义名称'),'池限制对照');
+  assert.ok(await evaluate(`document.querySelector('.history-parameters').textContent.includes('PCG64DXSM')`));
+  assert.ok(await evaluate(`document.querySelector('.history-parameters').textContent.includes('20:00（美东）')`));
+  await edit({'历史记录自定义名称':'池限制对照-重命名'});await clickText('保存名称');
+  await until(()=>evaluate(`document.querySelector('.history-record-header [role=status]')?.textContent.includes('名称已保存')`),'rename saved');
+  const renamed=await (await fetch(base+'/api/backtests/batches/'+latest.id+'?summary_only=1')).json();
+  assert.ok(renamed.name.includes('-池限制对照-重命名-'));assert.equal(renamed.name.split('-').at(-1),fullName.split('-').at(-1));
+  assert.deepEqual(renamed.config,summary.config);assert.deepEqual(renamed.summary,summary.summary);
+  await command('Page.navigate',{url:base+'/#backtest-history?record='+latest.id});
+  await until(()=>evaluate(`document.querySelector('[aria-label="历史记录自定义名称"]')?.value==='池限制对照-重命名'`),'history detail deep link and rename survive reload');
+  await clickText('重置条件');
+  await until(()=>evaluate(`document.querySelectorAll('.history-record').length>=3`),'reset restores all records');
+  await page(id=>document.querySelector('[data-record-id="'+id+'"]').click(),latest.id);
+  await until(()=>evaluate(`document.querySelectorAll('.history-detail .backtest-batch-averages strong').length===9`),'history detail ready');
+  await page(()=>window.scrollTo(0,0));
+  const historyShot=await command('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(path.join(run,'history-desktop.png'),Buffer.from(historyShot.data,'base64'));
+  const historyAfter=await state();assert.deepEqual(historyAfter.positions,before.positions);assert.deepEqual(historyAfter.bridge.jobs,before.bridge.jobs);assert.equal(historyAfter.strategy.status,before.strategy.status);
   const audit=JSON.parse(await readFile(path.join(run,'smoke.history-reads.json'),'utf8'));
   assert.ok(audit.every(x=>x.method==='GET'&&['/api/status','/api/symbols','/api/resolve','/api/history'].includes(x.path)));
   await command('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:false});await sleep(500);
   const layout=await evaluate('({width:document.body.scrollWidth,viewport:innerWidth})');assert.ok(layout.width<=layout.viewport+2);
-  const mobile=await command('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(path.join(run,'summary-mobile.png'),Buffer.from(mobile.data,'base64'));
+  const mobile=await command('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(path.join(run,'history-mobile.png'),Buffer.from(mobile.data,'base64'));
   assert.deepEqual(errors,[]);
-  return {ok:true,checks:['summary-only result page','no per-round or individual detail requests','weighted trade and stage averages','best/worst/mean cash curves','fee-inclusive and fee-free curve switch','10000 accounts','infinite accounts','parallel rounds','timing estimates','summary persistence','cancellation','no live trading state changed','responsive layout'],screenshots:[path.join(run,'summary-desktop.png'),path.join(run,'cash-curves.png'),path.join(run,'summary-mobile.png')]};
+  return {ok:true,checks:['summary-only result page','no per-round or individual detail requests','weighted trade and stage averages','best/worst/mean cash curves','fee-inclusive and fee-free curve switch','10000 accounts','infinite accounts','parallel rounds','timing estimates','summary persistence','cancellation','custom record names','history page root/strategy/date/regex filters','invalid regex feedback','rename preserves timestamp and original parameters','history detail deep links and reload','no live trading state changed','responsive layout'],screenshots:[path.join(run,'summary-desktop.png'),path.join(run,'cash-curves.png'),path.join(run,'history-desktop.png'),path.join(run,'history-mobile.png')]};
 }

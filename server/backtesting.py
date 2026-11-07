@@ -13,6 +13,7 @@ from .strategies import require_strategy
 from .trading_day import NEW_YORK
 from .backtest_batches import MAX_ROUNDS,MAX_PARALLEL
 from .backtest_random import ALGORITHM,LEGACY_ALGORITHM,normalize_seed
+from .backtest_history import custom_name
 
 PHASES=('1/2','2/2','live')
 MAX_ACCOUNT_COUNT=1_000_000
@@ -23,10 +24,11 @@ RULE_SOURCES=[
     dict(title='指数和商品单边 Taker 费 0.25 bps',url='https://docs.vestmarkets.com/trading/markets.md'),
     dict(title='等值微型合约与杠杆上限',url='https://docs.vestmarkets.com/trading/cross-margin-and-leverage'),
 ]
-DEFAULT_CONFIG=dict(strategy_id='random_entry',account_count=50,seed=42,rng_algorithm=LEGACY_ALGORITHM,seed_policy='fixed',rounds=1,parallel_workers=min(4,MAX_PARALLEL),initial_capital=5000,
+DEFAULT_CONFIG=dict(strategy_id='random_entry',record_name='',account_count=50,seed=42,rng_algorithm=LEGACY_ALGORITHM,seed_policy='fixed',rounds=1,parallel_workers=min(4,MAX_PARALLEL),initial_capital=5000,
     phase1_goal=500,phase2_goal=250,max_drawdown=300,daily_loss_percent=3,profit_split_percent=80,
     account_fee=15,payout_min_profit=1,live_profit_target=250,payout_delay_hours=24,
-    risk_reset_hour=20,strategy_reset_hour=17,initial_phase='1/2',repeat_daily=True,
+    risk_reset_hour=20,strategy_reset_hour=20,initial_phase='1/2',repeat_daily=True,
+    pool_limits_enabled=False,exam_pool_limit='infinity',live_pool_limit=10,
     batch_size=2,side='random',size_percent=25,stop_loss=130,skip_stop_loss_on_low_drawdown=False,
     drawdown_stop_loss_threshold=200,order_delay_min=2,order_delay_max=8,batch_delay_min=15,batch_delay_max=45,
     fee_bps=.25,slippage_mode='ticks',slippage_ticks=1,slippage_usd=1,slippage_bps=0,funding_bps_hourly=0,
@@ -43,6 +45,7 @@ def finite(value,label,low=0,high=1e9,integer=False):
 
 def validate_config(raw):
     c={**DEFAULT_CONFIG,**copy.deepcopy(raw)}
+    c['record_name']=custom_name(c['record_name'])
     try:c['seed']=normalize_seed(c['seed'])
     except (ValueError,OverflowError):raise ValidationError('随机种子格式无效：需32位整数或128位十六进制字符串') from None
     if c['rng_algorithm'] not in (ALGORITHM,LEGACY_ALGORITHM):raise ValidationError('随机数算法无效')
@@ -51,6 +54,9 @@ def validate_config(raw):
     c['parallel_workers']=finite(c['parallel_workers'],'并行任务数',1,MAX_PARALLEL,True)
     if c['account_count'] in ('∞','infinity'):c['account_count']='infinity'
     else:c['account_count']=finite(c['account_count'],'模拟账户数',1,MAX_ACCOUNT_COUNT,True)
+    for key,label in (('exam_pool_limit','考试号池上限'),('live_pool_limit','Live号池上限')):
+        if c[key] in ('∞','infinity'):c[key]='infinity'
+        else:c[key]=finite(c[key],label,1,MAX_ACCOUNT_COUNT,True)
     try:require_strategy(c['strategy_id'])
     except ValueError as exc:raise ValidationError(str(exc)) from None
     root=c.get('root')
@@ -76,7 +82,7 @@ def validate_config(raw):
     if c['size_percent'] not in (25,50,75,100) or isinstance(c['size_percent'],bool):raise ValidationError('仓位大小无效')
     if c['side'] not in ('buy','sell','random') or c['initial_phase'] not in PHASES or c['slippage_mode'] not in ('ticks','usd','bps') or c['sizing'] not in ('micro_contracts','vest_equivalent'):
         raise ValidationError('方向、阶段、数量或滑点模式无效')
-    for key in ('repeat_daily','skip_stop_loss_on_low_drawdown'):
+    for key in ('repeat_daily','skip_stop_loss_on_low_drawdown','pool_limits_enabled'):
         if not isinstance(c[key],bool):raise ValidationError(key+'必须为布尔值')
     for field in ('order_delay_min','order_delay_max','batch_delay_min','batch_delay_max'):
         c[field]=finite(c[field],field,0,86400)

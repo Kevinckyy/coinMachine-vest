@@ -87,6 +87,9 @@ class BacktestService:
             self.cancel_event.clear()
             if form is not None:self.store.setting('form',form)
             jid=uuid.uuid4().hex;self.store.save_job(jid,kind,'queued',{})
+            if form is not None:
+                self.store.save_batch(jid,form,dict(requested_rounds=form['rounds'],completed_rounds=0,parallel_workers=min(form['rounds'],form['parallel_workers']),
+                    duration_seconds=None,mean_round_seconds=None,**BatchStatistics().result()))
             self.active_id=jid
             def progress(detail):
                 if self.stop.is_set():raise ValidationError('服务关闭，任务中断')
@@ -102,12 +105,19 @@ class BacktestService:
                     detail={'message':str(exc)}
                     if kind=='batch':detail.update(batch_id=jid,summary=self.store.batch(jid)['summary'])
                     self.store.save_job(jid,kind,'cancelled',detail)
+                    if kind=='run':self._finish_empty(jid,'cancelled')
                 except Exception as exc:
                     detail={'error':str(exc)[:500]}
                     if kind=='batch':detail['batch_id']=jid
                     self.store.save_job(jid,kind,'error',detail)
+                    if kind in ('run','batch'):self._finish_empty(jid,'error')
             self.active=self.executor.submit(run)
             return {'job_id':jid,'kind':kind,'status':'queued'}
+
+    def _finish_empty(self,jid,status):
+        # A submitted run remains discoverable even when no round completed.
+        with self.store.lock,self.store.db:
+            self.store.db.execute('UPDATE bt_batches SET status=? WHERE id=? AND status=?',(status,jid,'running'))
 
     def sync(self,body):
         config=copy.deepcopy(body)

@@ -144,6 +144,14 @@ def create_server(engine, port=8765, host='127.0.0.1', static_dir=None,backtests
                 if path=='/api/strategies':return self._json({'strategies':catalogue()})
                 if path=='/api/backtests/meta':return self._json(backtests.metadata(engine.state()))
                 if path=='/api/backtests/runs':return self._json({'runs':backtests.store.runs()})
+                if path=='/api/backtests/history':
+                    q=parse_qs(parsed.query)
+                    try:
+                        offset=int(q.get('offset',['0'])[0]);limit=int(q.get('limit',['20'])[0])
+                        start=float(q['from'][0]) if 'from' in q else None;end=float(q['to'][0]) if 'to' in q else None
+                    except ValueError:raise ValidationError('历史时间或分页参数无效') from None
+                    return self._json(backtests.store.history(root=q.get('root',[''])[0],strategy_id=q.get('strategy_id',[''])[0],
+                        start=start,end=end,time_basis=q.get('time_basis',['created'])[0],pattern=q.get('pattern',[''])[0],offset=offset,limit=limit))
                 if re.fullmatch(r'/api/backtests/batches/[a-f0-9]{32}',path):
                     query=parse_qs(parsed.query)
                     try:offset=int(query.get('offset',['0'])[0]);limit=int(query.get('limit',['100'])[0])
@@ -210,6 +218,7 @@ def create_server(engine, port=8765, host='127.0.0.1', static_dir=None,backtests
                 elif path=='/api/backtests/sync':result=backtests.sync(body)
                 elif path=='/api/backtests/run':result=backtests.backtest(body)
                 elif path=='/api/backtests/estimate':result=backtests.estimate(body)
+                elif re.fullmatch(r'/api/backtests/history/[a-f0-9]{32}/name',path):result=backtests.store.rename_history(path.split('/')[4],body.get('custom_name'))
                 elif re.fullmatch(r'/api/backtests/jobs/[a-f0-9]{32}/cancel',path):result=backtests.cancel(path.split('/')[4])
                 elif path=='/api/backtests/cost-observation':result=backtests.observe_costs(body)
                 elif re.fullmatch(r'/api/accounts/[^/]+/toggle',path):

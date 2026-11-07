@@ -22,9 +22,9 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
-from .trading_day import trading_day_window
+from .trading_day import trading_day_window,entry_day_window
 from .phases import PhaseAccounting, PHASES, phase_rank
-from .strategies import catalogue,require_strategy,choose_batch,choose_side
+from .strategies import catalogue,require_strategy,choose_live_first,choose_side
 
 NQ_TRADE_PATHS = {'/trade/NQ-PERP','/trade/NDX-USD-PERP'}
 STRATEGY_FORM_DEFAULTS = dict(strategy_id='random_entry',batch_size=2, order_delay_min=2, order_delay_max=8,
@@ -489,7 +489,7 @@ class Engine(PhaseAccounting):
     def _roll_strategy_locks(self, now=None):
         """Expire local exclusions at the next NY close, preserving account risk."""
         now = self.clock() if now is None else now
-        day_start = trading_day_window(now)['start']
+        day_start = entry_day_window(now)['start']
         changed = False
         for account in self.data['accounts'].values():
             if account.get('merged_into') or execution_excluded(account):
@@ -514,7 +514,7 @@ class Engine(PhaseAccounting):
             if number(account.get('evaluation_passed_at')) is None:
                 prior = number(account.get('strategy_locked_at')) if account.get('strategy_lock_source')=='evaluation_passed' else None
                 account['evaluation_passed_at'] = self.clock() if prior is None else prior
-            if not new_event and account['evaluation_passed_at'] < trading_day_window(self.clock())['start']:
+            if not new_event and account['evaluation_passed_at'] < entry_day_window(self.clock())['start']:
                 return
         priority = {'manual':0,'external_close':1,'daily_completed':1,'take_profit':2,'stop_loss':2,'target_reached':2,'evaluation_passed':3}
         existing = account.get('strategy_lock_source')
@@ -574,7 +574,7 @@ class Engine(PhaseAccounting):
             self._lock_strategy(account,'当日交易已结束，退出自动策略','daily_completed')
 
     def _daily_entry_used(self, aid, *, exclude_job_id=None, window=None, phase=None):
-        period = window or trading_day_window(self.clock())
+        period = window or entry_day_window(self.clock())
         account=self._account(aid)
         scope=phase or account.get('phase')
         def same_phase(record):
@@ -645,7 +645,7 @@ class Engine(PhaseAccounting):
         if not account['enabled'] or account['status'] != 'active':
             raise ValidationError(f"{account['name']} 已停用、通过或被锁定")
         if self._daily_entry_used(aid):
-            raise ValidationError(f"{account['name']} 本交易日已开仓，每账户每日只允许一单（美东 17:00 日切）")
+            raise ValidationError(f"{account['name']} 本交易日已开仓，每账户每日只允许一单（美东 20:00 日切）")
         if self._position(aid) or self._pending(aid):
             raise ValidationError(f"{account['name']} 已有持仓或待确认操作")
         if account['mode']=='browser' and live_ready:
@@ -1065,7 +1065,8 @@ class Engine(PhaseAccounting):
                 s['preparation'] = {'status':'inactive','accounts':{}}
                 self._log('success', '策略完成：剩余可用账户不足一批，不重复使用账户')
                 return
-            batch = choose_batch(cfg.get('strategy_id','random_entry'),self.rng,eligible,cfg['batch_size'])
+            batch = choose_live_first(cfg.get('strategy_id','random_entry'),self.rng,eligible,cfg['batch_size'],
+                lambda aid:self._account(aid).get('phase')=='live' or self._account(aid).get('category')=='live')
             s['remaining_accounts'] = [a for a in s['remaining_accounts'] if a not in batch]
             s['batch_account_ids'] = list(batch)
             s['order_queue'] = list(batch)
@@ -1083,6 +1084,7 @@ class Engine(PhaseAccounting):
                 s['next_action_at'] = None
                 return
             # Browser failures/unknowns freeze globally before another order.
+            s['order_queue'].sort(key=lambda aid:0 if self._account(aid).get('phase')=='live' or self._account(aid).get('category')=='live' else 1)
             aid = s['order_queue'][0]
             if self._account(aid).get('phase_pending'):
                 return
@@ -2151,6 +2153,7 @@ class Engine(PhaseAccounting):
             result['positions'] = copy.deepcopy(list(d['positions'].values()))
             result['history'] = copy.deepcopy(sorted(d['history'], key=lambda h: h['closed_at'], reverse=True))
             result['trading_day'] = trading_day_window(now)
+            result['entry_day'] = entry_day_window(now)
             daily = {}
             for trade in d['history']:
                 closed = observed_time(trade.get('closed_at'))
@@ -2180,8 +2183,8 @@ class Engine(PhaseAccounting):
                 account.update({'daily_realized_pnl':round(pnl,2),'daily_trade_count':count})
                 self._sync_phase_book(account)
                 self._phase_summary(account,d['history'],result['trading_day'])
-                account['daily_entry_used'] = self._daily_entry_used(account['id'],window=result['trading_day'])
-                account['strategy_unlock_at'] = (trading_day_window(account['strategy_locked_at'])['end']
+                account['daily_entry_used'] = self._daily_entry_used(account['id'],window=result['entry_day'])
+                account['strategy_unlock_at'] = (entry_day_window(account['strategy_locked_at'])['end']
                     if not execution_excluded(account) and not account.get('retired_failed') and not account.get('archived') and account.get('strategy_locked') and number(account.get('strategy_locked_at')) is not None else None)
                 if account['mode']=='browser':
                     if account.get('auto_discovered'):

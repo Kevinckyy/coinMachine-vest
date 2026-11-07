@@ -18,6 +18,7 @@ import urllib.request
 from pathlib import Path
 
 from .engine import ValidationError
+from .backtest_history import BacktestHistory
 
 INSTRUMENTS = {
     'MNQ':dict(name='纳指微型',vest_symbol='NQ-PERP',point_value=2,tick_size=.25,leverage=50),
@@ -110,7 +111,7 @@ def validated_bar(raw,start,end,interval,now):
     return {k:raw[k] for k in keys}
 
 
-class BacktestStore:
+class BacktestStore(BacktestHistory):
     def __init__(self,path='runtime/backtests.sqlite'):
         if path!=':memory:':Path(path).resolve().parent.mkdir(parents=True,exist_ok=True)
         self.path=str(path);self.lock=threading.RLock()
@@ -123,6 +124,7 @@ class BacktestStore:
             CREATE TABLE IF NOT EXISTS bt_jobs(id TEXT PRIMARY KEY,kind TEXT,status TEXT,detail TEXT,updated_at REAL);
             CREATE TABLE IF NOT EXISTS bt_runs(id TEXT PRIMARY KEY,created_at REAL,result TEXT);
             CREATE TABLE IF NOT EXISTS bt_settings(key TEXT PRIMARY KEY,value TEXT);
+            CREATE TABLE IF NOT EXISTS bt_record_names(id TEXT PRIMARY KEY,custom_name TEXT NOT NULL,strategy_name TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS bt_details(run_id TEXT,kind TEXT,seq INTEGER,phase TEXT,payload TEXT,PRIMARY KEY(run_id,kind,seq));
             CREATE TABLE IF NOT EXISTS bt_batches(id TEXT PRIMARY KEY,created_at REAL,updated_at REAL,status TEXT,config TEXT,summary TEXT);
             CREATE TABLE IF NOT EXISTS bt_batch_rounds(batch_id TEXT,round_index INTEGER,run_id TEXT,seed INTEGER,duration REAL,metrics TEXT,PRIMARY KEY(batch_id,round_index));
@@ -211,6 +213,7 @@ class BacktestStore:
         with self.lock,self.db:
             self.db.execute('INSERT INTO bt_batches VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET updated_at=excluded.updated_at,status=excluded.status,summary=excluded.summary',
                 (jid,now,now,status,json.dumps(config,ensure_ascii=False),json.dumps(summary,ensure_ascii=False,allow_nan=False)))
+            self._history_name(jid,config)
 
     def save_batch_round(self,jid,index,result):
         with self.lock,self.db:self.db.execute('INSERT INTO bt_batch_rounds VALUES(?,?,?,?,?,?)',
@@ -233,7 +236,7 @@ class BacktestStore:
             if not row:raise ValidationError('多轮测试不存在',404)
             total=self.db.execute('SELECT COUNT(*) FROM bt_batch_rounds WHERE batch_id=?',(jid,)).fetchone()[0]
             rounds=[] if summary_only else self.db.execute('SELECT * FROM bt_batch_rounds WHERE batch_id=? ORDER BY round_index LIMIT ? OFFSET ?',(jid,limit,offset)).fetchall()
-        return {**dict(row),'config':json.loads(row['config']),'summary':json.loads(row['summary']),'total':total,'offset':offset,'limit':limit,
+        return {**dict(row),**self._history_fields(jid,row['created_at'],json.loads(row['config'])),'config':json.loads(row['config']),'summary':json.loads(row['summary']),'total':total,'offset':offset,'limit':limit,
             'rows':[{**dict(r),'metrics':json.loads(r['metrics'])} for r in rounds]}
 
     def batches(self):
@@ -245,7 +248,7 @@ class BacktestStore:
         records=[]
         for r in rows:
             summary=json.loads(r['summary']);summary.pop('cash_curves',None)
-            records.append({**dict(r),'config':json.loads(r['config']),'summary':summary})
+            records.append({**dict(r),**self._history_fields(r['id'],r['created_at'],json.loads(r['config'])),'config':json.loads(r['config']),'summary':summary})
         return records
 
     def _account_starts(self,result):
@@ -296,15 +299,23 @@ class BacktestStore:
 
     def _statistics_result(self,result):
         from .backtest_settlement import settle_archived,POLICY
-        if (result.get('settlement') or {}).get('policy')==POLICY:return result
+        from .backtest_expectancy import from_accounts,populate_metrics
         with self.lock:
-            cursor=self.db.execute("SELECT payload FROM bt_details WHERE run_id=? AND kind='claims'",(result['id'],))
-            first=cursor.fetchone()
+            if (result.get('settlement') or {}).get('policy')!=POLICY:
+                cursor=self.db.execute("SELECT payload FROM bt_details WHERE run_id=? AND kind='claims'",(result['id'],));first=cursor.fetchone()
+                try:
+                    def rows():
+                        yield json.loads(first[0])
+                        for row in cursor:yield json.loads(row[0])
+                    result=settle_archived(result,rows() if first else result.get('claims',[]))
+                finally:cursor.close()
+            if result['metrics'].get('remaining_expectancy') is not None:return populate_metrics(result)
+            cursor=self.db.execute("SELECT payload FROM bt_details WHERE run_id=? AND kind='accounts'",(result['id'],));first=cursor.fetchone()
             try:
-                def rows():
+                def accounts():
                     yield json.loads(first[0])
                     for row in cursor:yield json.loads(row[0])
-                return settle_archived(result,rows() if first else result.get('claims',[]))
+                return from_accounts(result,accounts() if first else result.get('accounts',[]))
             finally:cursor.close()
 
     def save_timing(self,signature,seconds,kind='run'):

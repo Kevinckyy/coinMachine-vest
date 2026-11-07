@@ -36,6 +36,8 @@ export async function runStrategyChecks({base,root,run,command,evaluate,clickTex
   assert.equal(await evaluate('document.querySelector(\'#strategy-form button[type=submit]\').disabled'),true);
   await command('Page.removeScriptToEvaluateOnNewDocument',{identifier:compatibility.identifier});
   await visit();
+  assert.ok(await evaluate(`document.querySelector('.strategy-rule').textContent.includes('美东 20:00')`));
+  assert.ok(await evaluate(`document.querySelector('.strategy-summary').textContent.includes('Live 优先')`));
   assert.equal(await value('剩余最大回撤阈值'),'200');
   assert.equal(await evaluate('document.querySelector(\'.strategy-stop-toggle input\').checked'),false);
   await edit({'每批账户数量':4,'策略止损金额':177.5,'账户下单最大延迟秒':21,'账户下单最小延迟秒':9,'批次最大间隔秒':71,'批次最小间隔秒':31});

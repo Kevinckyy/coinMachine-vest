@@ -2,8 +2,8 @@
 import copy
 
 STRATEGIES = {'random_entry': {
-    'id':'random_entry','name':'随机下单','version':1,
-    'description':'随机选择一批账户，逐笔等待随机间隔；整批持仓结束后等待下一批。',
+    'id':'random_entry','name':'随机下单','version':2,
+    'description':'优先选择 Live 号，同阶段随机抽取；逐笔等待随机间隔，整批持仓结束后等待下一批。',
     'live_symbols':['NQ-PERP'],'backtest_roots':['MNQ','MES','MGC','MCL'],
 }}
 
@@ -26,3 +26,12 @@ def choose_batch(strategy_id, rng, candidates, size):
 def choose_side(strategy_id, rng, side):
     require_strategy(strategy_id)
     return rng.choice(('buy','sell')) if side=='random' else side
+
+
+def choose_live_first(strategy_id,rng,candidates,size,is_live):
+    live=[a for a in candidates if is_live(a)]
+    if not live:return choose_batch(strategy_id,rng,candidates,size)
+    picked=choose_batch(strategy_id,rng,live,min(size,len(live)))
+    if len(picked)<size:
+        picked+=choose_batch(strategy_id,rng,[a for a in candidates if not is_live(a)],size-len(picked))
+    return picked

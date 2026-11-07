@@ -12,7 +12,7 @@ def stamp(value):
 
 class LockRolloverTests(unittest.TestCase):
     def setUp(self):
-        self.now=stamp('2026-11-04T21:59:00Z')
+        self.now=stamp('2026-11-05T00:59:00Z')
         self.engine=Engine(':memory:',seed=False,clock=lambda:self.now)
 
     def tearDown(self):
@@ -28,7 +28,7 @@ class LockRolloverTests(unittest.TestCase):
             if source=='evaluation_passed':
                 account['status']='passed'
             self.engine._lock_strategy(account,source,source)
-        self.now=stamp('2026-11-04T22:00:00Z')
+        self.now=stamp('2026-11-05T01:00:00Z')
         self.engine.tick(price=100)
         for account in self.engine.state()['accounts']:
             with self.subTest(account=account['name']):
@@ -39,7 +39,7 @@ class LockRolloverTests(unittest.TestCase):
         self.assertEqual(self.engine.data['strategy']['status'],'idle')
         self.assertFalse(self.engine.data['jobs'])
 
-    def test_beijing_midnight_does_not_unlock_before_17_new_york(self):
+    def test_beijing_midnight_does_not_unlock_before_20_new_york(self):
         self.now=stamp('2026-11-04T15:59:59Z')
         account=self.account()
         self.engine.strategy_lock_account(account['id'],True)
@@ -47,8 +47,8 @@ class LockRolloverTests(unittest.TestCase):
         self.assertTrue(self.engine.state()['accounts'][0]['strategy_locked'])
 
     def test_dst_cutoffs_and_expiry_metadata(self):
-        for start,end in [('2026-03-07T22:00:00Z','2026-03-08T21:00:00Z'),
-                          ('2026-10-31T21:00:00Z','2026-11-01T22:00:00Z')]:
+        for start,end in [('2026-03-08T01:00:00Z','2026-03-09T00:00:00Z'),
+                          ('2026-11-01T00:00:00Z','2026-11-02T01:00:00Z')]:
             with self.subTest(start=start):
                 self.now=stamp(start)
                 account=self.account(start)
@@ -100,7 +100,7 @@ class LockRolloverTests(unittest.TestCase):
                     {'name':'Passed browser','category':'passed','current':True,'observed_at':self.now,
                      'balance':1100,'equity':1100,'unrealized_pnl':0}]})['accounts'][0]
         self.assertTrue(observe()['strategy_locked'])
-        self.now=stamp('2026-11-04T22:00:00Z')
+        self.now=stamp('2026-11-05T01:00:00Z')
         account=observe()
         self.assertFalse(account['strategy_locked'])
         self.assertEqual(account['status'],'passed')
@@ -110,9 +110,9 @@ class LockRolloverTests(unittest.TestCase):
     def test_explicit_new_day_manual_lock_stays_until_following_close(self):
         account=self.account()
         self.engine.strategy_lock_account(account['id'],True)
-        self.now=stamp('2026-11-04T22:00:00Z')
+        self.now=stamp('2026-11-05T01:00:00Z')
         self.engine.strategy_lock_account(account['id'],True)
         shown=self.engine.state()['accounts'][0]
         self.assertTrue(shown['strategy_locked'])
         self.assertEqual(shown['strategy_locked_at'],self.now)
-        self.assertEqual(shown['strategy_unlock_at'],stamp('2026-11-05T22:00:00Z'))
+        self.assertEqual(shown['strategy_unlock_at'],stamp('2026-11-06T01:00:00Z'))

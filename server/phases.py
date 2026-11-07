@@ -137,6 +137,6 @@ class PhaseAccounting:
             daily=[t for t in trades if window['start']<=closed_at(t)<window['end'] and closed_at(t)<=self.clock()]
             book['daily_realized_pnl']=round(sum(t['pnl'] for t in daily),2)
             book['daily_trade_count']=len(daily)
-            book['daily_entry_used']=self._daily_entry_used(account['id'],phase=phase,window=window)
+            book['daily_entry_used']=self._daily_entry_used(account['id'],phase=phase)
         current=books.get(account.get('phase'),{})
         account['phase_realized_pnl']=current.get('history_realized_pnl',0) if account.get('phase') else None

@@ -2,10 +2,10 @@ import {useEffect,useRef,useState} from 'react';
 import {Activity,Download,Play,RefreshCw} from 'lucide-react';
 import BacktestBatchResults,{type Batch,wallDuration} from './BacktestBatchResults';
 
-type Config={strategy_id:string;root:string;symbol:string;interval:number;from:number;to:number;account_count:number|'infinity';seed:number|string;rng_algorithm:string;seed_policy:string;rounds:number;parallel_workers:number;
+type Config={strategy_id:string;record_name:string;root:string;symbol:string;interval:number;from:number;to:number;account_count:number|'infinity';seed:number|string;rng_algorithm:string;seed_policy:string;rounds:number;parallel_workers:number;
   initial_capital:number;phase1_goal:number;phase2_goal:number;max_drawdown:number;daily_loss_percent:number;profit_split_percent:number;
   account_fee:number;payout_min_profit:number;live_profit_target:number;payout_delay_hours:number;risk_reset_hour:number;strategy_reset_hour:number;
-  initial_phase:string;repeat_daily:boolean;batch_size:number;side:string;size_percent:number;stop_loss:number;skip_stop_loss_on_low_drawdown:boolean;
+  initial_phase:string;repeat_daily:boolean;pool_limits_enabled:boolean;exam_pool_limit:number|'infinity';live_pool_limit:number|'infinity';batch_size:number;side:string;size_percent:number;stop_loss:number;skip_stop_loss_on_low_drawdown:boolean;
   drawdown_stop_loss_threshold:number;order_delay_min:number;order_delay_max:number;batch_delay_min:number;batch_delay_max:number;
   fee_bps:number;slippage_mode:string;slippage_ticks:number;slippage_usd:number;slippage_bps:number;funding_bps_hourly:number;leverage:number;sizing:string;cost_source:string};
 type NumericKey={[K in keyof Config]:Config[K] extends number?K:never}[keyof Config];
@@ -24,7 +24,7 @@ async function api<T>(url:string,body?:unknown,timeout=15000):Promise<T>{
 const number=(n:number|null|undefined,d=2)=>n==null?'—':n.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
 const stamp=(t:number)=>new Date(t*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
 const localDate=(t:number)=>new Date(t*1000+8*3600000).toISOString().slice(0,16);
-const timingKey=(config:Config)=>JSON.stringify(Object.fromEntries(Object.keys(config).sort().filter(key=>!['seed','seed_policy','rounds','parallel_workers'].includes(key)).map(key=>[key,config[key as keyof Config]])));
+const timingKey=(config:Config)=>JSON.stringify(Object.fromEntries(Object.keys(config).sort().filter(key=>!['seed','seed_policy','rounds','parallel_workers','record_name'].includes(key)).map(key=>[key,config[key as keyof Config]])));
 
 export default function BacktestPanel(){
   const [meta,setMeta]=useState<Meta|null>(null),[form,setForm]=useState<Config|null>(null),[error,setError]=useState('');
@@ -109,6 +109,7 @@ export default function BacktestPanel(){
   const chooseSeries=(symbol:string)=>{const next=meta.inventory.find(x=>x.symbol===symbol&&x.interval===form.interval);let range:Partial<Config>={};if(next&&(form.from>next.last_time||form.to<next.first_time))range={from:Math.max(next.first_time,next.last_time-30*86400),to:next.last_time};update({symbol,...range});};
   const chooseRoot=(root:string)=>{const options=meta.inventory.filter(x=>x.root===root&&x.interval===form.interval);const next=options.find(x=>metadata(x).continuous)||options[0];update({root,symbol:next?.symbol||'',leverage:meta.instruments[root].leverage});};
   const accountCountField=<label className="field"><span className="field-label">模拟账户数</span><input aria-label="回测模拟账户数" type="number" min="1" max="1000000" step="1" required={form.account_count!=='infinity'} disabled={form.account_count==='infinity'} placeholder={form.account_count==='infinity'?'∞':''} value={typeof form.account_count==='number'&&Number.isFinite(form.account_count)?form.account_count:''} onChange={e=>update({account_count:e.target.valueAsNumber})}/><small>支持 1–1,000,000 个整数；也可选择 ∞ 持续补号。</small></label>;
+  const poolLimit=(key:'exam_pool_limit'|'live_pool_limit',label:string)=><label className="field"><span className="field-label">{label}</span><input aria-label={'回测'+label} type="number" min="1" max="1000000" step="1" required={form.pool_limits_enabled&&form[key]!=='infinity'} disabled={!form.pool_limits_enabled||form[key]==='infinity'} placeholder={form[key]==='infinity'?'∞':''} value={typeof form[key]==='number'&&Number.isFinite(form[key])?form[key]:''} onChange={e=>update({[key]:e.target.valueAsNumber})}/><span><input aria-label={label+'不限'} type="checkbox" disabled={!form.pool_limits_enabled} checked={form[key]==='infinity'} onChange={e=>update({[key]:e.target.checked?'infinity':key==='live_pool_limit'?10:100})}/> ∞ 不限</span></label>;
   const currentEstimate=estimate&&timingKey(estimate.config)===formTimingKey?estimate:null;
   const workers=Math.min(form.parallel_workers,form.rounds);
   const estimatedTotal=currentEstimate?Math.ceil(form.rounds/workers)*currentEstimate.per_round_seconds*(workers>1?1.15:1)+(workers>1?1.5:0):null;
@@ -130,6 +131,9 @@ export default function BacktestPanel(){
         <label className="field"><span className="field-label">自动策略</span><select aria-label="回测自动策略" value={form.strategy_id} onChange={e=>update({strategy_id:e.target.value})}>{meta.strategies.map(s=><option value={s.id} key={s.id}>{s.name}</option>)}</select></label>
         <label className="backtest-check"><input aria-label="回测无限账户" type="checkbox" checked={form.account_count==='infinity'} onChange={e=>{if(e.target.checked){if(typeof form.account_count==='number'&&Number.isFinite(form.account_count))finiteAccountCount.current=form.account_count;update({account_count:'infinity'});}else update({account_count:finiteAccountCount.current});}}/>∞ 不限账户总数，账户不足一批时补充新号，持续至结束时间</label><div className="two-columns">{accountCountField}{numeric('batch_size','每批账户数',{min:1,max:form.account_count==='infinity'?10000:Math.min(form.account_count,10000),step:1})}<label className="field"><span className="field-label">方向</span><select aria-label="回测方向" value={form.side} onChange={e=>update({side:e.target.value})}><option value="random">随机做多 / 做空</option><option value="buy">仅做多</option><option value="sell">仅做空</option></select></label></div>
         <div className="two-columns"><label className="field"><span className="field-label">仓位大小</span><select aria-label="回测仓位大小" value={form.size_percent} onChange={e=>update({size_percent:Number(e.target.value)})}>{[25,50,75,100].map(x=><option value={x} key={x}>{x}%</option>)}</select></label>{numeric('leverage','杠杆',{min:1,max:meta.instruments[form.root].leverage,hint:'默认使用官方市场上限，可按订单界面的实际杠杆修改。'})}</div>
+        <label className="backtest-check"><input aria-label="回测账号池限制" type="checkbox" checked={form.pool_limits_enabled} onChange={e=>update({pool_limits_enabled:e.target.checked})}/>限制同时存活的账号池</label>
+        <div className="two-columns">{poolLimit('exam_pool_limit','考试号上限 m')}{poolLimit('live_pool_limit','Live号上限 n')}</div>
+        <p className="form-footnote">考试 1/2、2/2 合计占用 m；失败释放名额。Live 满时，二阶段已通过的账号保留资格并暂停交易，按通过顺序等待空位。Live 优先选批和下单，开启限制时允许不足一批执行。未启用的计划号不占池位。</p>
         <label className="field"><span className="field-label">数量模式</span><select value={form.sizing} onChange={e=>update({sizing:e.target.value})}><option value="micro_contracts">整数微型合约等值数量</option><option value="vest_equivalent">允许小数的 Vest 等值数量（回测假设）</option></select></label>
         <div className="two-columns">{numeric('stop_loss','每笔止损 USDC',{min:.01})}{numeric('drawdown_stop_loss_threshold','不设止损阈值 USDC',{min:.01})}</div>
         <label className="backtest-check"><input type="checkbox" checked={form.skip_stop_loss_on_low_drawdown} onChange={e=>update({skip_stop_loss_on_low_drawdown:e.target.checked})}/>剩余最大回撤小于阈值时不设置止损</label>
@@ -137,7 +141,7 @@ export default function BacktestPanel(){
         <label className="backtest-check"><input type="checkbox" checked={form.repeat_daily} onChange={e=>update({repeat_daily:e.target.checked})}/>每个交易日重新启动一轮随机策略</label><p className="form-footnote">关闭后同一账户每阶段只在本轮参与一次；秒级等待会向下一根K线开盘取整。</p>
       </div></section>
       <section className="panel"><div className="panel-heading"><h2>03 · Vest 方案与出金模拟</h2></div><div className="backtest-body"><p className="form-footnote">{meta.current_profile?.source||'默认 5K 两阶段方案：10% / 5% 目标、3% 日亏损、6% 固定回撤、80% 分润。'}</p>
-        <div className="two-columns">{numeric('initial_capital','初始资金',{min:1})}{numeric('account_fee','单号购买成本')}{numeric('phase1_goal','第一阶段目标',{min:.01})}{numeric('phase2_goal','第二阶段目标',{min:.01})}{numeric('max_drawdown','固定最大回撤',{min:.01})}{numeric('daily_loss_percent','日亏损比例 %',{max:100,hint:'填 0 表示方案没有日亏损限制。'})}{numeric('risk_reset_hour','风控日切（美东时）',{max:23,step:1})}{numeric('strategy_reset_hour','开仓额度日切（美东时）',{max:23,step:1})}</div>
+        <div className="two-columns">{numeric('initial_capital','初始资金',{min:1})}{numeric('account_fee','单号购买成本')}{numeric('phase1_goal','第一阶段目标',{min:.01})}{numeric('phase2_goal','第二阶段目标',{min:.01})}{numeric('max_drawdown','固定最大回撤',{min:.01})}{numeric('daily_loss_percent','日亏损比例 %',{max:100,hint:'填 0 表示方案没有日亏损限制。'})}{numeric('risk_reset_hour','风控日切（美东时）',{max:23,step:1,hint:'默认美东20:00，可填写0–23整点；按所填时间回测。'})}{numeric('strategy_reset_hour','开仓额度日切（美东时）',{max:23,step:1,hint:'默认美东20:00，可填写0–23整点；保存后沿用自定义时间。'})}</div>
         <label className="field"><span className="field-label">起始阶段</span><select value={form.initial_phase} onChange={e=>update({initial_phase:e.target.value})}><option value="1/2">第一阶段（完整考试）</option><option value="2/2">第二阶段</option><option value="live">live（不统计考试通过率）</option></select></label>
         <div className="two-columns">{numeric('live_profit_target','live 出金平仓目标',{hint:'模拟退出条件，非平台强制目标；填 0 只在自然平仓后申请分润。'})}{numeric('payout_min_profit','最低可申请利润',{min:.01})}{numeric('profit_split_percent','分润比例 %',{max:100})}{numeric('payout_delay_hours','分润到账延迟小时')}</div>
       </div></section>
@@ -147,6 +151,7 @@ export default function BacktestPanel(){
         <p className="form-footnote">{form.cost_source}。当前盘口滑点和滑点容忍度都不能当成历史成交滑点；回测始终按保存的假设计算。</p>
       </div></section>
       <section className="panel backtest-plan"><div className="panel-heading"><h2>05 · 多轮随机种子与耗时</h2></div><div className="backtest-body">
+        <label className="field"><span className="field-label">记录自定义名称</span><input aria-label="回测记录自定义名称" maxLength={80} placeholder="例如：十月低回撤对照" value={form.record_name} onChange={e=>update({record_name:e.target.value})}/><small>保存为“{meta.strategies.find(s=>s.id===form.strategy_id)?.name||form.strategy_id}－{form.record_name.trim()||'未命名'}－时间戳”，时间戳为提交时的北京时间。可在历史页修改自定义部分。</small></label>
         <div className="two-columns">{numeric('rounds','测试轮数',{min:1,max:4294967296,step:1,hint:'自由填写正整数，每轮重新运行所选时间范围。'})}{numeric('parallel_workers','并行任务数',{min:1,max:meta.parallelism_limit||1,step:1,hint:`最多 ${meta.parallelism_limit||1} 个 CPU 工作进程；实际并行数不超过轮数，并行越多内存占用越高。`})}</div>
         <p className="form-footnote" aria-label="回测随机规则">每次开始自动随机选择起始种子，每轮从系统随机源独立抽取 128 位种子，同批不重复。策略随机数采用 PCG64DXSM，实际种子与算法版本保存以便复现。每轮独立重置账户，∞ 设置作用于每一轮的账户池。</p>
         <div className="backtest-time-estimate" aria-label="回测耗时预估"><div><span>单轮预估</span><strong>{wallDuration(currentEstimate?.per_round_seconds)}</strong></div><div><span>{workers} 个任务并行 · 总预估</span><strong>{wallDuration(estimatedTotal)}</strong></div></div>

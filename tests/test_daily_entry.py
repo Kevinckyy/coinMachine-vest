@@ -89,8 +89,8 @@ class DailyEntryTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.engine.start_strategy(self.strategy(aid))
 
-    def test_17_et_rollover_resets_entry_quota_and_automatically_unlocks(self):
-        self.now=datetime.fromisoformat('2026-11-04T21:59:59+00:00').timestamp()
+    def test_20_et_rollover_resets_entry_quota_and_automatically_unlocks(self):
+        self.now=datetime.fromisoformat('2026-11-05T00:59:59+00:00').timestamp()
         aid=self.account()
         self.engine.place_orders(self.order(aid))
         self.engine.close_position(next(iter(self.engine.data['positions'])))

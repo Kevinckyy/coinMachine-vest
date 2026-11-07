@@ -17,8 +17,8 @@ class BacktestCancelled(Exception):pass
 
 
 def performance_key(config,revision):
-    body={k:v for k,v in config.items() if k not in ('seed','seed_policy','rounds','parallel_workers')}
-    return hashlib.sha256(json.dumps([6,revision,body],sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    body={k:v for k,v in config.items() if k not in ('seed','seed_policy','rounds','parallel_workers','record_name')}
+    return hashlib.sha256(json.dumps([8,revision,body],sort_keys=True,separators=(',',':')).encode()).hexdigest()
 
 
 def estimate_duration(config,samples):
