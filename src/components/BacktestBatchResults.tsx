@@ -1,10 +1,12 @@
 import {useEffect,useState} from 'react';
+import BacktestTimeStatistics,{type TimeStatistics} from './BacktestTimeStatistics';
 type Aggregate={count:number;mean:number;min:number;max:number;stddev:number};
 type Point={time:number;value:number};
 type Seed=number|string;
 type CurveSet={available:boolean;reason:string;rounds:number;best:{seed:Seed;final_cash:number;points:Point[]}|null;worst:{seed:Seed;final_cash:number;points:Point[]}|null;average:Point[]};
 export type Batch={id:string;name?:string;custom_name?:string;strategy_name?:string;created_at?:number;status:string;config:{rounds:number;seed:Seed;seed_policy?:string;rng_algorithm?:string;parallel_workers:number;symbol?:string;pool_limits_enabled?:boolean;exam_pool_limit?:number|'infinity';live_pool_limit?:number|'infinity'};
   summary:{completed_rounds:number;requested_rounds:number;parallel_workers:number;duration_seconds:number|null;mean_round_seconds:number|null;metrics:Record<string,Aggregate>;
+    time_statistics?:TimeStatistics;
     expectancy?:{basis:string;complete_rounds:number;incomplete_rounds:number};
     trading:{total_accounts:number;total_trades:number;avg_trades_per_account:number|null;avg_holding_seconds:number|null;stages:{phase:string;accounts:number;trades:number;avg_trades:number|null;avg_holding_seconds:number|null}[]};
     settlement?:{settled_rounds:number;legacy_rounds:number;trading_end:number|null;settlement_end:number|null};dataset?:{symbol:string;source?:string;bars:number;first_time:number;last_time:number};cash_curves:{with_fees:CurveSet;without_fees:CurveSet}}};
@@ -19,7 +21,7 @@ export const wallDuration=(seconds:number|null|undefined)=>{
 const n=(v:number|null|undefined)=>v==null?'—':v.toLocaleString('en-US',{maximumFractionDigits:2,minimumFractionDigits:2});
 const count=(v:number|undefined)=>v==null?'—':v.toLocaleString('en-US',{maximumFractionDigits:0});
 const seedLabel=(seed:Seed)=>typeof seed==='string'&&seed.length>20?seed.slice(0,10)+'…'+seed.slice(-8):String(seed);
-const stamp=(t:number)=>new Date(t*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+const stamp=(t:number)=>new Date(t*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})+' UTC+8';
 const fields:[string,string,boolean?][]=[['win_rate','胜率',true],['total_pnl','总净盈亏'],['exam_pass_rate','考试通过率',true],['payout_rate','出金率',true],['total_payout','总出金'],['avg_payout_per_account','单号平均出金'],['net_cash','出金减购号成本'],['total_fees','账户内交易手续费'],['settled_after_cutoff','截止后到账分润']];
 
 function CashChart({curves}:{curves:CurveSet}){
@@ -50,7 +52,7 @@ export default function BacktestBatchResults({batch,batches,onBatch,showChooser=
     {batch.name&&showChooser&&<p className="backtest-note">{batch.name} · <a href={'#backtest-history?record='+batch.id}>在历史管理页查看</a></p>}
     <p className="backtest-note">已完成 {batch.summary.completed_rounds} / {batch.config.rounds} 轮 · {batch.summary.parallel_workers} 个并行任务 · 总耗时 {wallDuration(batch.summary.duration_seconds)} · 单轮实测平均 {wallDuration(batch.summary.mean_round_seconds)} · {({running:'运行中',completed:'已完成',cancelled:'已停止',interrupted:'已中断',error:'出错'} as Record<string,string>)[batch.status]||batch.status}</p>
     <p className="backtest-note">{batch.config.rng_algorithm==='pcg64dxsm_v1'?'PCG64DXSM · 每轮独立随机选择128位种子，实际种子已保存':'历史记录 · MT19937，沿用原种子规则'}</p>
-    {batch.summary.dataset&&<p className="backtest-note">{batch.summary.dataset.symbol} · {count(batch.summary.dataset.bars)} 根 · {new Date(batch.summary.dataset.first_time*1000).toLocaleDateString('zh-CN',{timeZone:'Asia/Shanghai'})} — {new Date(batch.summary.dataset.last_time*1000).toLocaleDateString('zh-CN',{timeZone:'Asia/Shanghai'})} · {batch.summary.dataset.source}</p>}
+    {batch.summary.dataset&&<p className="backtest-note">{batch.summary.dataset.symbol} · {count(batch.summary.dataset.bars)} 根 · 行情日期（UTC+8）{new Date(batch.summary.dataset.first_time*1000).toLocaleDateString('zh-CN',{timeZone:'Asia/Shanghai'})} — {new Date(batch.summary.dataset.last_time*1000).toLocaleDateString('zh-CN',{timeZone:'Asia/Shanghai'})} · {batch.summary.dataset.source}</p>}
     {batch.summary.settlement?.trading_end&&<p className="backtest-note">交易截止 {stamp(batch.summary.settlement.trading_end)} · 分润结算至 {stamp(batch.summary.settlement.settlement_end||batch.summary.settlement.trading_end)}。截止后停止交易，仅结算已有分润申请；最终出金率、总出金和资金曲线包含该结算尾段。</p>}
     {!!batch.summary.settlement?.legacy_rounds&&<p className="backtest-note">{batch.summary.settlement.legacy_rounds} 轮历史记录缺少完整分润明细，仍沿用截止时口径；重新回测后可完整结算。</p>}
     <div className="backtest-batch-averages">{fields.map(([key,label,percent])=>{const metric=batch.summary.metrics[key];if(key==='avg_payout_per_account'){
@@ -63,6 +65,7 @@ export default function BacktestBatchResults({batch,batches,onBatch,showChooser=
     <div className="backtest-pooled-stats"><h3>交易统计 · 汇总全部已完成轮次</h3><div className="backtest-time-estimate"><div><span>每号平均单数</span><strong aria-label="统计每号平均单数">{n(trading?.avg_trades_per_account)}</strong></div><div><span>平均持仓时间</span><strong aria-label="统计平均持仓时间">{wallDuration(trading?.avg_holding_seconds)}</strong></div></div><p className="backtest-note">累计 {count(trading?.total_accounts)} 个统计账户，{count(trading?.total_trades)} 笔交易。每号平均单数=总单数/统计账户数；平均持仓时间按已平仓笔数加权。</p></div>
     <div className="table-scroll backtest-stage-statistics"><table><thead><tr><th>阶段</th><th>累计账户数</th><th>累计单数</th><th>各阶段平均单数</th><th>平均持仓时间</th></tr></thead><tbody>{trading?.stages.map(stage=><tr key={stage.phase}><td>{stage.phase}</td><td>{count(stage.accounts)}</td><td>{count(stage.trades)}</td><td>{n(stage.avg_trades)}</td><td>{wallDuration(stage.avg_holding_seconds)}</td></tr>)}</tbody></table></div>
     <p className="backtest-note">各阶段平均单数=该阶段总单数/进入该阶段的累计账户数。固定池初始阶段包含未参与账户；∞ 按实际生成账户统计。</p>
+    <BacktestTimeStatistics key={batch.id} id={batch.id} rounds={batch.summary.completed_rounds} statistics={batch.summary.time_statistics}/>
     <div className="backtest-cash-heading"><h3>资金曲线 · 总出金 − 总成本</h3><div className="mode-switch"><button aria-label="资金曲线含手续费" aria-pressed={feeMode==='with_fees'} className={feeMode==='with_fees'?'active':''} onClick={()=>setFeeMode('with_fees')}>含交易手续费</button><button aria-label="资金曲线不含手续费" aria-pressed={feeMode==='without_fees'} disabled={!curves?.without_fees?.available} className={feeMode==='without_fees'?'active':''} onClick={()=>setFeeMode('without_fees')}>不含交易手续费</button></div></div>
     {curves&&<CashChart curves={curves[feeMode]}/>}
     <p className="backtest-note">总出金包含截止后按原延迟全部到账的已申请分润，截止后到账分润已计入总出金。固定池从起点计入全部计划购号成本，∞ 按实际补号时点计入成本。交易手续费只从考核 / Live 账户余额扣除，出金按扣费后的 Live 利润分润，现金曲线不重复扣费。不含手续费按相同种子重算，仅交易手续费置零；滑点、资金费和购号成本保留。切换仅改变资金曲线，上方统计沿用配置的手续费。</p>

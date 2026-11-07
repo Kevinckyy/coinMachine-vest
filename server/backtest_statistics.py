@@ -2,8 +2,9 @@
 from bisect import bisect_right
 from .backtest_batches import MetricSummary
 from .backtest_expectancy import populate_metrics
+from .backtest_time_statistics import TimeSummary,from_trades
 
-STATISTICS_VERSION=3
+STATISTICS_VERSION=4
 
 
 def cash_points(result,starts=None,without_fees=False):
@@ -62,9 +63,11 @@ class BatchStatistics:
         self.with_fees=CurveSummary();self.without_fees=CurveSummary();self.dataset=None
         self.settled_rounds=0;self.trading_end=None;self.settlement_end=None
         self.expectancy_complete=0
+        self.time_statistics=TimeSummary()
 
     def add_result(self,result,starts=None):
         result=populate_metrics(result)
+        self.time_statistics.add(result.get('time_statistics') or from_trades(result,result.get('trades',[])))
         if result['metrics'].get('remaining_expectancy') is not None:self.expectancy_complete+=1
         if self.dataset is None:self.dataset=result.get('dataset')
         settlement=result.get('settlement') or {}
@@ -94,6 +97,7 @@ class BatchStatistics:
             phases.append({**r,'avg_trades':r['trades']/r['accounts'] if r['accounts'] else None,
                 'avg_holding_seconds':r['total_holding_seconds']/r['closed_trades'] if r['closed_trades'] else None})
         return dict(statistics_version=STATISTICS_VERSION,metrics=self.metrics.result(),dataset=self.dataset,
+            time_statistics=self.time_statistics.result(),
             expectancy=dict(basis='fair_zero_cost_continuation',complete_rounds=self.expectancy_complete,incomplete_rounds=self.count-self.expectancy_complete),
             settlement=dict(settled_rounds=self.settled_rounds,legacy_rounds=self.count-self.settled_rounds,
                 trading_end=self.trading_end,settlement_end=self.settlement_end),

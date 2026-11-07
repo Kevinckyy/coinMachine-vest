@@ -43,6 +43,7 @@ class BatchTests(unittest.TestCase):
                     self.assertEqual(run['config']['rounds'],1)
                     expected=simulate(run['config'],bars,INSTRUMENT)
                     self.assertEqual(run['metrics'],expected['metrics'])
+                    self.assertEqual(run['time_statistics'],expected['time_statistics'])
                 summary=batch['summary']['metrics']['total_pnl']
                 self.assertAlmostEqual(summary['mean'],sum(actual)/3)
                 self.assertAlmostEqual(summary['stddev'],math.sqrt(sum((x-sum(actual)/3)**2 for x in actual)/3))
@@ -73,6 +74,8 @@ class BatchTests(unittest.TestCase):
                     self.assertEqual(run['metrics'],expected['metrics'])
                     self.assertEqual(service.store.details(run['id'],'trades')['total'],run['metrics']['total_trades'])
                 self.assertEqual(len(fingerprints),1)
+                self.assertEqual(batch['summary']['time_statistics']['complete_rounds'],4)
+                self.assertEqual(batch['summary']['time_statistics']['incomplete_rounds'],0)
                 self.assertIn(batch['summary']['dataset_sha256'],fingerprints)
                 self.assertEqual(list(Path(tmp).glob('batch-workers-*')),[],'temporary worker databases cleaned up')
             finally:service.close()

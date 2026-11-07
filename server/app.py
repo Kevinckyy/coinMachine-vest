@@ -157,6 +157,14 @@ def create_server(engine, port=8765, host='127.0.0.1', static_dir=None,backtests
                     try:offset=int(query.get('offset',['0'])[0]);limit=int(query.get('limit',['100'])[0])
                     except ValueError:raise ValidationError('多轮分页参数无效') from None
                     return self._json(backtests.store.batch(path.rsplit('/',1)[1],offset,limit,summary_only=query.get('summary_only')==['1']))
+                if re.fullmatch(r'/api/backtests/batches/[a-f0-9]{32}/trade-times',path):
+                    query=parse_qs(parsed.query)
+                    try:offset=int(query.get('offset',['0'])[0]);limit=int(query.get('limit',['20'])[0])
+                    except ValueError:raise ValidationError('开平仓记录分页参数无效') from None
+                    return self._json(backtests.store.trade_times(path.split('/')[4],offset,limit))
+                if re.fullmatch(r'/api/backtests/batches/[a-f0-9]{32}/time-statistics',path):
+                    query=parse_qs(parsed.query)
+                    return self._json(backtests.store.zone_statistics(path.split('/')[4],query.get('zone',['America/New_York'])[0]))
                 if re.fullmatch(r'/api/backtests/jobs/[a-f0-9]{32}',path):return self._json(backtests.store.job(path.rsplit('/',1)[1]))
                 if re.fullmatch(r'/api/backtests/runs/[a-f0-9]{32}',path):return self._json(backtests.store.run(path.rsplit('/',1)[1]))
                 if re.fullmatch(r'/api/backtests/runs/[a-f0-9]{32}/details',path):

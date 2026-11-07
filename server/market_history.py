@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .engine import ValidationError
 from .backtest_history import BacktestHistory
+from .backtest_time_statistics import BacktestTimeStore
 
 INSTRUMENTS = {
     'MNQ':dict(name='纳指微型',vest_symbol='NQ-PERP',point_value=2,tick_size=.25,leverage=50),
@@ -111,7 +112,7 @@ def validated_bar(raw,start,end,interval,now):
     return {k:raw[k] for k in keys}
 
 
-class BacktestStore(BacktestHistory):
+class BacktestStore(BacktestHistory,BacktestTimeStore):
     def __init__(self,path='runtime/backtests.sqlite'):
         if path!=':memory:':Path(path).resolve().parent.mkdir(parents=True,exist_ok=True)
         self.path=str(path);self.lock=threading.RLock()
@@ -125,6 +126,9 @@ class BacktestStore(BacktestHistory):
             CREATE TABLE IF NOT EXISTS bt_runs(id TEXT PRIMARY KEY,created_at REAL,result TEXT);
             CREATE TABLE IF NOT EXISTS bt_settings(key TEXT PRIMARY KEY,value TEXT);
             CREATE TABLE IF NOT EXISTS bt_record_names(id TEXT PRIMARY KEY,custom_name TEXT NOT NULL,strategy_name TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS bt_time_statistics(run_id TEXT PRIMARY KEY,version INTEGER NOT NULL,payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS bt_time_grids(run_id TEXT PRIMARY KEY,payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS bt_time_zones(batch_id TEXT,zone TEXT,revision TEXT,payload TEXT,PRIMARY KEY(batch_id,zone));
             CREATE TABLE IF NOT EXISTS bt_details(run_id TEXT,kind TEXT,seq INTEGER,phase TEXT,payload TEXT,PRIMARY KEY(run_id,kind,seq));
             CREATE TABLE IF NOT EXISTS bt_batches(id TEXT PRIMARY KEY,created_at REAL,updated_at REAL,status TEXT,config TEXT,summary TEXT);
             CREATE TABLE IF NOT EXISTS bt_batch_rounds(batch_id TEXT,round_index INTEGER,run_id TEXT,seed INTEGER,duration REAL,metrics TEXT,PRIMARY KEY(batch_id,round_index));
@@ -133,6 +137,7 @@ class BacktestStore(BacktestHistory):
             CREATE INDEX IF NOT EXISTS bt_timing_signature ON bt_timings(signature,id);
             CREATE INDEX IF NOT EXISTS bt_runs_created ON bt_runs(created_at DESC);
             CREATE INDEX IF NOT EXISTS bt_batch_run ON bt_batch_rounds(run_id);
+            CREATE INDEX IF NOT EXISTS bt_trade_open_time ON bt_details(run_id,json_extract(payload,'$.opened_at') DESC,seq DESC) WHERE kind='trades';
         ''')
         self.db.commit()
 
@@ -247,7 +252,7 @@ class BacktestStore(BacktestHistory):
         with self.lock:rows=self.db.execute('SELECT * FROM bt_batches ORDER BY created_at DESC LIMIT 20').fetchall()
         records=[]
         for r in rows:
-            summary=json.loads(r['summary']);summary.pop('cash_curves',None)
+            summary=json.loads(r['summary']);summary.pop('cash_curves',None);summary.pop('time_statistics',None)
             records.append({**dict(r),**self._history_fields(r['id'],r['created_at'],json.loads(r['config'])),'config':json.loads(r['config']),'summary':summary})
         return records
 
@@ -309,13 +314,13 @@ class BacktestStore(BacktestHistory):
                         for row in cursor:yield json.loads(row[0])
                     result=settle_archived(result,rows() if first else result.get('claims',[]))
                 finally:cursor.close()
-            if result['metrics'].get('remaining_expectancy') is not None:return populate_metrics(result)
+            if result['metrics'].get('remaining_expectancy') is not None:return self._time_result(populate_metrics(result))
             cursor=self.db.execute("SELECT payload FROM bt_details WHERE run_id=? AND kind='accounts'",(result['id'],));first=cursor.fetchone()
             try:
                 def accounts():
                     yield json.loads(first[0])
                     for row in cursor:yield json.loads(row[0])
-                return from_accounts(result,accounts() if first else result.get('accounts',[]))
+                return self._time_result(from_accounts(result,accounts() if first else result.get('accounts',[])))
             finally:cursor.close()
 
     def save_timing(self,signature,seconds,kind='run'):

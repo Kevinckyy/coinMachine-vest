@@ -12,6 +12,7 @@ from .engine import ValidationError
 from .strategies import require_strategy,choose_batch,choose_side
 from .backtest_random import create_stream
 from .backtest_expectancy import account_value,populate_metrics
+from .backtest_time_statistics import RoundTimeStatistics
 
 
 def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
@@ -28,6 +29,7 @@ def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
     # position sizing independent of quantity-dependent price impact.
     fixed_slippage=c['slippage_usd'] if c['slippage_mode']=='usd' else 0.
     active={};positions={};ready=[];ready_index={};pending=[];details=DetailPreview(detail_sink)
+    time_stats=RoundTimeStatistics()
     pool_counts={'exam':0,'live':0};pool_peaks={'exam':0,'live':0};waiting_live=deque()
     def room(kind):
         limit=c[kind+'_pool_limit'] if c['pool_limits_enabled'] else 'infinity'
@@ -112,10 +114,11 @@ def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
         totals['trades']+=1;totals['wins']+=pnl>0;totals['pnl']+=pnl;totals['fees']+=fee;totals['fixed_slippage']+=fixed_slippage
         phase=PHASES[a['phase']];record=a['phase_records'][phase];held=max(0,ts-p['opened_at']);stage=stages[phase]
         for r in (record,stage):r['closed']+=1;r['holding']+=held;r['pnl']+=pnl
-        details.record('trades',dict(id=totals['trades'],account_id=a['id'],phase=phase,symbol=c['symbol'],side='buy' if p['direction']>0 else 'sell',quantity=p['quantity'],
+        trade=dict(id=totals['trades'],account_id=a['id'],phase=phase,symbol=c['symbol'],side='buy' if p['direction']>0 else 'sell',quantity=p['quantity'],
             opened_at=p['opened_at'],closed_at=ts,entry_price=p['entry_price'],exit_price=exit_price,gross_pnl=round(gross,8),fees=round(p['entry_fee']+fee,8),
             slippage_mode=c['slippage_mode'],fixed_slippage_usd=round(p['entry_slippage']+fixed_slippage,8),
-            funding=round(p['funding'],8),pnl=round(pnl,8),stop_loss=p['stop_loss'],remaining_drawdown=p['remaining_drawdown'],reason=reason,holding_seconds=held))
+            funding=round(p['funding'],8),pnl=round(pnl,8),is_win=pnl>0,stop_loss=p['stop_loss'],remaining_drawdown=p['remaining_drawdown'],reason=reason,holding_seconds=held)
+        details.record('trades',trade);time_stats.add(trade)
         a['position']=None;positions.pop(a['id'],None);a['lock_day']=ny_day(ts,c['strategy_reset_hour'])
         floor=max(capital-c['max_drawdown'],a['daily_floor'] if a['daily_floor'] is not None else -math.inf)
         if reason in ('max_drawdown','daily_loss') or a['balance']<floor-1e-8:
@@ -267,7 +270,7 @@ def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
         total_holding_seconds=sum(r['holding'] for r in stages.values()),closed_trades=totals['trades'],
         avg_holding_seconds=sum(r['holding'] for r in stages.values())/totals['trades'] if totals['trades'] else None)
     progress(dict(completed=len(bars),total=len(bars),trades=totals['trades'],accounts=totals['created'],active_positions=0))
-    result=dict(config=c,simulation_version=8,strategy_version=require_strategy(c['strategy_id'])['version'],metrics=metrics,stages=stage_metrics,curve=curve,
+    result=dict(config=c,simulation_version=9,time_statistics=time_stats.result(totals['trades'],bars[0]['time'],end),strategy_version=require_strategy(c['strategy_id'])['version'],metrics=metrics,stages=stage_metrics,curve=curve,
         randomness=dict(algorithm=c['rng_algorithm'],seed=c['seed'],seed_policy=c['seed_policy'],
             seed_bits=128 if isinstance(c['seed'],str) else 32,sampler_version=1,library_version=getattr(rng,'library_version',None)),
         settlement=dict(policy='settle_submitted_claims',trading_end=end,settlement_end=settlement_end,

@@ -126,6 +126,55 @@ export async function runBacktestChecks({base,run,command,evaluate,clickText,unt
   assert.ok(await evaluate(`!!document.querySelector('[aria-label="账号池汇总"]')`));
   assert.ok(summary.summary.metrics.settled_after_cutoff.mean>0);
   assert.ok(summary.summary.settlement.settlement_end>summary.summary.settlement.trading_end);
+  const timeStats=summary.summary.time_statistics;
+  assert.equal(timeStats.complete_rounds,3);assert.equal(timeStats.incomplete_rounds,0);
+  assert.equal(timeStats.recorded_trades,summary.summary.trading.total_trades);
+  const selectTime=async(label,value)=>page(({label,value})=>{const el=document.querySelector('[aria-label='+CSS.escape(label)+']');Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(el,value);el.dispatchEvent(new Event('change',{bubbles:true}));},{label,value});
+  assert.equal(await evaluate(`document.querySelectorAll('.time-hour-table tbody tr').length`),24);
+  assert.equal(await evaluate(`document.querySelectorAll('[data-time-bar=daily_opens]').length`),24);
+  await selectTime('开平仓次数平均口径','round');
+  assert.equal(await evaluate(`document.querySelectorAll('[data-time-bar=mean_closes]').length`),24);
+  await selectTime('时间统计时区','Asia/Shanghai');
+  for(const axis of ['weekday','week','month','hour']){
+    await selectTime('收益时间分组',axis);
+    assert.equal(await evaluate(`document.querySelectorAll('.time-outcome-table tbody tr').length`),timeStats.zones['Asia/Shanghai'][axis].length);
+  }
+  await selectTime('收益时间统计指标','mean_round_pnl');
+  assert.equal(await evaluate(`document.querySelectorAll('[data-time-bar=mean_round_pnl]').length`),24);
+  assert.equal(await evaluate(`performance.getEntriesByType('resource').filter(x=>x.name.includes('/trade-times')).length`),0,'timestamp pages load only when expanded');
+  await page(()=>document.querySelector('.time-trade-records summary').click());
+  await until(()=>evaluate(`document.querySelectorAll('.time-trade-table tbody tr').length>0 && document.querySelector('.time-trade-table').getAttribute('aria-busy')==='false'`),'paged open and close timestamps');
+  const timePage=await (await fetch(base+'/api/backtests/batches/'+latest.id+'/trade-times?limit=20')).json();
+  assert.equal(timePage.total,timeStats.recorded_trades);assert.equal(timePage.complete,true);
+  const displayed=await evaluate(`[...document.querySelectorAll('.time-trade-table tbody tr:first-child td')].map(e=>e.textContent)`);
+  const expectedTimes=await page(t=>[t.opened_at,t.closed_at].map(ts=>new Date(ts*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false,timeZoneName:'short'})),timePage.rows[0]);
+  assert.deepEqual(displayed.slice(2,4),expectedTimes);
+  const allTimes=await (await fetch(base+'/api/backtests/batches/'+latest.id+'/trade-times?limit=100')).json();assert.equal(allTimes.rows.length,allTimes.total);
+  const applyUtcOffset=async hours=>{
+    await edit({'UTC时区偏移小时':hours});await clickText('应用时区');
+    const minutes=Math.round(hours*60),zone='UTC'+(minutes>=0?'+':'-')+String(Math.floor(Math.abs(minutes)/60)).padStart(2,'0')+':'+String(Math.abs(minutes)%60).padStart(2,'0');
+    await until(()=>page(zone=>document.querySelector('[aria-label="当前统计时区"]').textContent.includes(zone)&&document.querySelectorAll('.time-hour-table tbody tr').length===24,zone),'fixed UTC offset statistics');return zone;
+  };
+  assert.ok(await evaluate(`document.querySelector('[aria-label="当前统计时区"]').textContent.includes('UTC+08:00')`));
+  await selectTime('时间统计时区','fixed');await until(()=>evaluate(`!!document.querySelector('[aria-label="UTC时区偏移小时"]')`),'UTC offset input');
+  for(const hours of [-12,5.5,14]){
+    const zone=await applyUtcOffset(hours);
+    const fixed=await (await fetch(base+'/api/backtests/batches/'+latest.id+'/time-statistics?'+new URLSearchParams({zone}))).json();
+    const openCounts=Array(24).fill(0),closeCounts=Array(24).fill(0);
+    for(const t of allTimes.rows){openCounts[new Date((t.opened_at+hours*3600)*1000).getUTCHours()]++;closeCounts[new Date((t.closed_at+hours*3600)*1000).getUTCHours()]++;}
+    assert.deepEqual(fixed.zones[zone].hour.map(r=>r.trades),openCounts);assert.deepEqual(fixed.zones[zone].hour.map(r=>r.closes),closeCounts);
+    const shown=await evaluate(`[...document.querySelectorAll('.time-hour-table tbody tr')].map(row=>Number(row.cells[6].textContent.replaceAll(',','')))`);assert.deepEqual(shown,openCounts);
+    const actual=await evaluate(`document.querySelector('.time-trade-table tbody tr td:nth-child(3)').textContent`);
+    const expected=await page(({t,hours,zone})=>new Date((t.opened_at+hours*3600)*1000).toLocaleString('zh-CN',{timeZone:'UTC',hour12:false})+' '+zone,{t:timePage.rows[0],hours,zone});assert.equal(actual,expected);
+    assert.ok(await page(zone=>[...document.querySelectorAll('.time-chart-zone')].every(e=>e.textContent.includes(zone)),zone));
+  }
+  await edit({'UTC时区偏移小时':5.1});assert.equal(await evaluate(`[...document.querySelectorAll('.time-offset-controls button')].find(e=>e.textContent.includes('应用时区')).disabled`),true);
+  await applyUtcOffset(5.5);await page(()=>document.querySelector('.backtest-time-statistics').scrollIntoView({block:'start'}));
+  const zoneShot=await command('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(path.join(run,'timezone-custom-desktop.png'),Buffer.from(zoneShot.data,'base64'));
+  await selectTime('时间统计时区','Asia/Shanghai');
+  if(timePage.total>20){await clickText('下一页','.time-trade-records button');await until(()=>evaluate(`document.querySelectorAll('.time-trade-table tbody tr').length>0 && document.querySelector('.time-trade-table').getAttribute('aria-busy')==='false'`),'next timestamp page');await clickText('上一页','.time-trade-records button');}
+  await page(()=>document.querySelector('.backtest-time-statistics').scrollIntoView({block:'start'}));
+  const timeShot=await command('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(path.join(run,'time-statistics-desktop.png'),Buffer.from(timeShot.data,'base64'));
   assert.ok(await evaluate(`document.querySelector('.backtest-batch').textContent.includes('截止后停止交易')`));
   await page(()=>{const svg=document.querySelector('[aria-label="最好最差平均资金曲线"]');const box=svg.getBoundingClientRect();svg.dispatchEvent(new PointerEvent('pointermove',{bubbles:true,clientX:box.right,clientY:box.top+100}));});
   await page(()=>document.querySelector('[aria-label="资金曲线不含手续费"]').click());
@@ -168,6 +217,8 @@ export async function runBacktestChecks({base,run,command,evaluate,clickText,unt
   await edit({'历史名称正则':'^'+escapedName+'$'});await filter();
   await page(id=>document.querySelector('[data-record-id="'+id+'"]').click(),latest.id);
   await until(()=>evaluate(`document.querySelectorAll('.history-detail .backtest-batch-averages strong').length===9 && !!document.querySelector('.history-parameters dl')`),'saved summary and full parameter snapshot');
+  assert.equal(await evaluate(`document.querySelectorAll('.history-detail .time-hour-table tbody tr').length`),24);
+  assert.equal(await field('时间统计时区'),'Asia/Shanghai');
   await clickText('刷新','.history-filter-panel button');
   await until(()=>evaluate(`document.querySelectorAll('.history-detail .backtest-batch-averages strong').length===9 && document.querySelector('.history-record-list').getAttribute('aria-busy')==='false'`),'refresh updates selected detail too');
   assert.equal(await field('历史记录自定义名称'),'池限制对照');
@@ -184,6 +235,10 @@ export async function runBacktestChecks({base,run,command,evaluate,clickText,unt
   await until(()=>evaluate(`document.querySelectorAll('.history-record').length>=3`),'reset restores all records');
   await page(id=>document.querySelector('[data-record-id="'+id+'"]').click(),latest.id);
   await until(()=>evaluate(`document.querySelectorAll('.history-detail .backtest-batch-averages strong').length===9`),'history detail ready');
+  await choose('时间统计时区','fixed');await applyUtcOffset(5.75);
+  await command('Page.navigate',{url:base+'/#backtest-history?record='+latest.id});
+  await until(()=>evaluate(`document.querySelector('[aria-label="UTC时区偏移小时"]')?.value==='5.75' && document.querySelectorAll('.time-hour-table tbody tr').length===24`),'custom UTC offset persists in history after reload');
+  assert.ok(await evaluate(`document.querySelector('[aria-label="当前统计时区"]').textContent.includes('UTC+05:45')`));
   await page(()=>window.scrollTo(0,0));
   const historyShot=await command('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(path.join(run,'history-desktop.png'),Buffer.from(historyShot.data,'base64'));
   const historyAfter=await state();assert.deepEqual(historyAfter.positions,before.positions);assert.deepEqual(historyAfter.bridge.jobs,before.bridge.jobs);assert.equal(historyAfter.strategy.status,before.strategy.status);
@@ -192,6 +247,10 @@ export async function runBacktestChecks({base,run,command,evaluate,clickText,unt
   await command('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:false});await sleep(500);
   const layout=await evaluate('({width:document.body.scrollWidth,viewport:innerWidth})');assert.ok(layout.width<=layout.viewport+2);
   const mobile=await command('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(path.join(run,'history-mobile.png'),Buffer.from(mobile.data,'base64'));
+  await page(()=>document.querySelector('.backtest-time-statistics').scrollIntoView({block:'start'}));
+  const timeLayout=await evaluate('({width:document.body.scrollWidth,viewport:innerWidth})');assert.ok(timeLayout.width<=timeLayout.viewport+2);
+  await until(()=>evaluate(`[...document.querySelectorAll('.time-hour-charts .time-chart-scroll')].every(e=>e.scrollWidth<=e.clientWidth+2)`),'all 24 hours fit the mobile charts');
+  const timeMobile=await command('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});await writeFile(path.join(run,'time-statistics-mobile.png'),Buffer.from(timeMobile.data,'base64'));
   assert.deepEqual(errors,[]);
-  return {ok:true,checks:['summary-only result page','no per-round or individual detail requests','weighted trade and stage averages','best/worst/mean cash curves','fee-inclusive and fee-free curve switch','10000 accounts','infinite accounts','parallel rounds','timing estimates','summary persistence','cancellation','custom record names','history page root/strategy/date/regex filters','invalid regex feedback','rename preserves timestamp and original parameters','history detail deep links and reload','no live trading state changed','responsive layout'],screenshots:[path.join(run,'summary-desktop.png'),path.join(run,'cash-curves.png'),path.join(run,'history-desktop.png'),path.join(run,'history-mobile.png')]};
+  return {ok:true,checks:['summary-only result page','no per-round or individual detail requests','weighted trade and stage averages','best/worst/mean cash curves','fee-inclusive and fee-free curve switch','10000 accounts','infinite accounts','parallel rounds','timing estimates','summary persistence','cancellation','custom record names','history page root/strategy/date/regex filters','invalid regex feedback','rename preserves timestamp and original parameters','history detail deep links and reload','hourly opens/closes and holding durations','hour/weekday/week/month outcomes','statistics time-zone switch','negative/half-hour/quarter-hour UTC offsets regroup data','time-zone labels and persisted selection','paged trade timestamps in results and history','no live trading state changed','responsive layout'],screenshots:[path.join(run,'summary-desktop.png'),path.join(run,'cash-curves.png'),path.join(run,'history-desktop.png'),path.join(run,'history-mobile.png'),path.join(run,'time-statistics-desktop.png'),path.join(run,'time-statistics-mobile.png'),path.join(run,'timezone-custom-desktop.png')]};
 }
