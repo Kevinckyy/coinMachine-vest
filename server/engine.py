@@ -24,7 +24,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from .trading_day import trading_day_window,entry_day_window
 from .phases import PhaseAccounting, PHASES, phase_rank
-from .strategies import catalogue,require_strategy,choose_live_first,choose_side
+from .strategies import catalogue,require_strategy,choose_live_first,choose_batch_side
 
 NQ_TRADE_PATHS = {'/trade/NQ-PERP','/trade/NDX-USD-PERP'}
 STRATEGY_FORM_DEFAULTS = dict(strategy_id='random_entry',batch_size=2, order_delay_min=2, order_delay_max=8,
@@ -888,6 +888,10 @@ class Engine(PhaseAccounting):
 
     def _open_one(self, aid, cfg, source):
         account = self._eligible(aid,for_strategy=source=='strategy')
+        if source=='strategy':
+            self._assert_strategy_batch_side(aid,cfg)
+            s=self.data['strategy']
+            cfg={**cfg,'strategy_run_id':s['run_id'],'strategy_batch_number':s['batch_number']}
         if account['mode'] == 'browser':
             if cfg.get('skip_stop_loss_on_low_drawdown'):
                 cfg = {**cfg,'configured_stop_loss':cfg['stop_loss']}
@@ -1081,6 +1085,52 @@ class Engine(PhaseAccounting):
         """Compatibility response for retired preparation windows; no side effects."""
         return {'active':False,'accounts':[],'disabled':True}
 
+    def _batch_side_preferences(self, members):
+        cfg=self.data['strategy']['config']
+        return [cfg.get('live_side','random') if self._is_live_account(self._account(aid)) else cfg['side'] for aid in members]
+
+    def _strategy_batch_side(self, symbol):
+        """Persist once; recover legacy batches from observed executions, never reroll."""
+        s=self.data['strategy'];members=set(s.get('batch_account_ids',[]))
+        if not s.get('run_id'):s['run_id']=uuid.uuid4().hex
+        saved=s.get('batch_directions',{}).get(symbol);known={saved} if saved in ('buy','sell') else set()
+        for p in self.data['positions'].values():
+            if p['account_id'] in members and p.get('source')=='strategy' and p.get('symbol')==symbol:
+                known.add(p['side'])
+        day_start=entry_day_window(self.clock())['start']
+        for aid in members:
+            records=[]
+            for j in self.data['jobs'].values():
+                if j['account_id']!=aid or j.get('source')!='strategy' or j.get('type')!='open' or j.get('symbol')!=symbol:continue
+                if j.get('strategy_run_id')==s.get('run_id') and j.get('strategy_batch_number')==s['batch_number']:
+                    if j.get('delivered_at') is not None:known.add(j['side'])
+                elif saved is None and not j.get('strategy_run_id') and (aid not in s.get('order_queue',[]) or j['status']=='queued'):
+                    if j.get('created_at',0)>=day_start and (j.get('delivered_at') is not None or j['status']=='queued'):records.append(j)
+            if saved is None and aid not in s.get('order_queue',[]):
+                records += [t for t in self.data['history'] if t['account_id']==aid and t.get('source')=='strategy' and
+                            t.get('symbol')==symbol and isinstance(t.get('opened_at'),(int,float)) and t['opened_at']>=day_start]
+            if records:known.add(max(records,key=lambda x:x.get('opened_at',x.get('created_at',0)))['side'])
+        if len(known)>1:
+            raise ValidationError('同批同品种已存在方向冲突，禁止继续开仓，请核对原批次')
+        if saved is not None and saved not in ('buy','sell'):
+            raise ValidationError('已保存的批次方向无效，禁止继续开仓')
+        if saved is None:
+            try:
+                preferences=self._batch_side_preferences(members)+list(known)
+                saved=choose_batch_side(s['config'].get('strategy_id','random_entry'),self.rng,preferences)
+            except ValueError as exc:raise ValidationError(str(exc)) from None
+            s.setdefault('batch_directions',{})[symbol]=saved
+        return saved
+
+    def _assert_strategy_batch_side(self, aid, order):
+        s=self.data['strategy'];symbol=order.get('symbol')
+        if (s['status'] not in self.ACTIVE or aid not in s.get('batch_account_ids',[]) or symbol!=s['config'].get('symbol') or
+            (order.get('strategy_run_id') is not None and order['strategy_run_id']!=s.get('run_id')) or
+            (order.get('strategy_batch_number') is not None and order['strategy_batch_number']!=s.get('batch_number'))):
+            raise ValidationError('策略开仓不属于当前批次，禁止派发')
+        if order.get('side')!=self._strategy_batch_side(symbol):
+            raise ValidationError('同批同品种必须同向，已拦截反向开仓')
+
     def _strategy_tick(self, now):
         s = self.data['strategy']
         if s['status'] not in self.ACTIVE:
@@ -1115,6 +1165,13 @@ class Engine(PhaseAccounting):
                 return
             batch = choose_live_first(cfg.get('strategy_id','random_entry'),self.rng,eligible,cfg['batch_size'],
                 lambda aid:self._account(aid).get('phase')=='live' or self._account(aid).get('category')=='live')
+            try:
+                side=choose_batch_side(cfg.get('strategy_id','random_entry'),self.rng,self._batch_side_preferences(batch))
+            except ValueError as exc:
+                s.update(status='paused',next_action_at=None)
+                self._log('error',f'策略暂停，整批未开仓：{exc}')
+                return
+            s['batch_directions']={cfg['symbol']:side}
             s['remaining_accounts'] = [a for a in s['remaining_accounts'] if a not in batch]
             s['batch_account_ids'] = list(batch)
             s['order_queue'] = list(batch)
@@ -1122,7 +1179,7 @@ class Engine(PhaseAccounting):
             s['phase'] = 'submitting'
             s['status'] = 'running'
             s['upcoming_account_ids'] = []
-            self._log('info', f"第 {s['batch_number']} 批：随机选定 {len(batch)} 个账户")
+            self._log('info', f"第 {s['batch_number']} 批：随机选定 {len(batch)} 个账户；{cfg['symbol']} 统一{'做多' if side=='buy' else '做空'}")
         if s['phase'] == 'submitting':
             # Accounts can be locked while the per-account jitter is running.
             s['order_queue'] = [a for a in s['order_queue'] if not self._account(a).get('strategy_locked')
@@ -1137,14 +1194,12 @@ class Engine(PhaseAccounting):
             if self._account(aid).get('phase_pending'):
                 return
             order_cfg = {k: cfg[k] for k in ('symbol','quantity','size_percent','take_profit','stop_loss','skip_stop_loss_on_low_drawdown','drawdown_stop_loss_threshold') if k in cfg}
-            direction=cfg['side']
             if self._is_live_account(self._account(aid)):
                 for key in ('take_profit','stop_loss','skip_stop_loss_on_low_drawdown','drawdown_stop_loss_threshold'):
                     order_cfg[key]=cfg.get('live_'+key,STRATEGY_FORM_DEFAULTS['live_'+key])
                 if 'size_percent' in order_cfg:order_cfg['size_percent']=cfg.get('live_size_percent',25)
-                direction=cfg.get('live_side','random')
-            order_cfg['side'] = choose_side(cfg.get('strategy_id','random_entry'),self.rng,direction)
             try:
+                order_cfg['side']=self._strategy_batch_side(cfg['symbol'])
                 self._open_one(aid, order_cfg, 'strategy')
             except ValidationError as exc:
                 s['status'] = 'paused'
@@ -1829,6 +1884,12 @@ class Engine(PhaseAccounting):
                 for candidate in self.data['jobs'].values():
                     if candidate['account_id'] != aid or candidate['status']!='queued':
                         continue
+                    if candidate['type']=='open' and candidate.get('source')=='strategy':
+                        try:self._assert_strategy_batch_side(aid,candidate)
+                        except ValidationError as exc:
+                            candidate.update(status='cancelled',cancel_reason=str(exc))
+                            self._freeze(aid,f'策略开仓派发已拦截：{exc}')
+                            break
                     if candidate['type']=='open' and self._daily_entry_used(aid,exclude_job_id=candidate['id']):
                         candidate['status']='cancelled'
                         candidate['cancel_reason']='本交易日已使用一次开仓额度'
@@ -1986,7 +2047,7 @@ class Engine(PhaseAccounting):
                 cfg = {k: job[k] for k in ('symbol','side','quantity','take_profit','stop_loss')}
                 if 'size_percent' in job:
                     cfg['size_percent'] = job['size_percent']
-                for key in ('configured_stop_loss','skip_stop_loss_on_low_drawdown','drawdown_stop_loss_threshold','stop_loss_omitted','remaining_drawdown_at_entry'):
+                for key in ('configured_stop_loss','skip_stop_loss_on_low_drawdown','drawdown_stop_loss_threshold','stop_loss_omitted','remaining_drawdown_at_entry','strategy_run_id','strategy_batch_number'):
                     if key in job:
                         cfg[key] = job[key]
                 position = {'id': uuid.uuid4().hex, 'account_id': account['id'], 'account_name': account['name'],
@@ -2215,6 +2276,8 @@ class Engine(PhaseAccounting):
             if s['status']!='paused' or s.get('phase') not in ('monitoring','cooldown') or s.get('order_queue'):
                 raise ValidationError('当前状态不能继续原监控批次，请核对后重新启动策略',409)
             self._assert_settled_browser_actions()
+            symbols={p['symbol'] for p in self.data['positions'].values() if p.get('source')=='strategy' and p['account_id'] in s.get('batch_account_ids',[])}
+            for symbol in symbols:self._strategy_batch_side(symbol)
             for aid in s.get('remaining_accounts',[]):self._eligible(aid,for_strategy=True)
             for aid in s.get('batch_account_ids',[]):
                 position=self._position(aid)
@@ -2305,6 +2368,7 @@ class Engine(PhaseAccounting):
             d = self.data
             result = {k: copy.deepcopy(d[k]) for k in ('mode','strategy','candles','market','preferences')}
             result['strategies']=catalogue()
+            result['capabilities']={'strategy_batch_same_side':True}
             result['accounts'] = copy.deepcopy([a for a in d['accounts'].values() if not a.get('merged_into')])
             result['positions'] = copy.deepcopy(list(d['positions'].values()))
             result['history'] = copy.deepcopy(sorted(d['history'], key=lambda h: h['closed_at'], reverse=True))

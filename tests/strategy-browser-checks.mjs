@@ -35,9 +35,29 @@ export async function runStrategyChecks({base,root,run,command,evaluate,clickTex
   assert.equal(await evaluate('document.querySelector(\'#strategy-form fieldset\').disabled'),true);
   assert.equal(await evaluate('document.querySelector(\'#strategy-form button[type=submit]\').disabled'),true);
   await command('Page.removeScriptToEvaluateOnNewDocument',{identifier:compatibility.identifier});
+  const withoutDirectionGuard=await command('Page.addScriptToEvaluateOnNewDocument',{source:'('+(()=>{
+    window.__fixtureMissingBatchGuard=true;
+    const realFetch=window.fetch.bind(window);
+    window.fetch=async(...args)=>{
+      const response=await realFetch(...args);
+      if(String(args[0])!=='/api/state'||!response.ok)return response;
+      const state=await response.json();delete state.capabilities;
+      return new Response(JSON.stringify(state),{status:response.status,headers:response.headers});
+    };
+  }).toString()+')()'});
+  await command('Page.navigate',{url:base});
+  await until(()=>evaluate('window.__fixtureMissingBatchGuard===true && !!document.querySelector(\'h1\')'),'server without batch-direction guard');
+  await clickText('自动策略','aside button');
+  await until(()=>evaluate('document.querySelector(\'.batch-direction-upgrade\')?.textContent.includes(\'重启本地服务\')'),'missing guard upgrade feedback');
+  assert.equal(await evaluate('document.querySelector(\'#strategy-form button[type=submit]\').disabled'),true);
+  assert.equal((await(await fetch(base+'/api/state')).json()).strategy.status,'idle');
+  await command('Page.removeScriptToEvaluateOnNewDocument',{identifier:withoutDirectionGuard.identifier});
   await visit();
   assert.ok(await evaluate(`document.querySelector('.strategy-rule').textContent.includes('美东 20:00')`));
   assert.ok(await evaluate(`document.querySelector('.strategy-summary').textContent.includes('Live 优先')`));
+  assert.ok(await evaluate(`document.querySelector('[data-testid="strategy-batch-direction-rule"]').textContent.includes('同批同品种必须同向')`));
+  assert.ok(await evaluate(`document.querySelector('[data-testid="strategy-batch-direction-rule"]').textContent.includes('随机方向每批只抽取一次')`));
+  assert.ok(await evaluate(`document.querySelector('[data-testid="strategy-batch-direction-rule"]').textContent.includes('固定方向相反时整批暂停')`));
   assert.equal(await value('剩余最大回撤阈值'),'200');
   assert.equal(await evaluate('document.querySelector(\'.strategy-stop-toggle input\').checked'),false);
   assert.equal(await value('Live 止损金额'),'130');

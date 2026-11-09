@@ -9,7 +9,7 @@ from collections import deque
 from .backtesting import PHASES,RULE_SOURCES,ny_day,validate_config
 from .backtest_runtime import UnusedAccounts,DetailPreview
 from .engine import ValidationError
-from .strategies import require_strategy,choose_batch,choose_side
+from .strategies import require_strategy,choose_batch,choose_batch_side
 from .backtest_random import create_stream
 from .backtest_expectancy import account_value,populate_metrics
 from .backtest_time_statistics import RoundTimeStatistics
@@ -41,7 +41,7 @@ def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
     stages={phase:dict(accounts=0,passed=0,failed=0,trades=0,closed=0,holding=0.,pnl=0.) for phase in PHASES}
     if not unlimited:stages[c['initial_phase']]['accounts']=c['account_count']
     if not unlimited and initial_phase==2:totals['funded']=c['account_count']
-    curve=[];batch=[];queue=[];next_order=bars[0]['time'];next_batch=next_order;last_day=None;last_progress=time.monotonic()
+    curve=[];batch=[];queue=[];batch_number=0;next_order=bars[0]['time'];next_batch=next_order;last_day=None;last_progress=time.monotonic()
 
     def phase_record(now):return dict(entered_at=now,trades=0,closed=0,holding=0,pnl=0,passed=False)
 
@@ -114,7 +114,7 @@ def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
         totals['trades']+=1;totals['wins']+=pnl>0;totals['pnl']+=pnl;totals['fees']+=fee;totals['fixed_slippage']+=fixed_slippage
         phase=PHASES[a['phase']];record=a['phase_records'][phase];held=max(0,ts-p['opened_at']);stage=stages[phase]
         for r in (record,stage):r['closed']+=1;r['holding']+=held;r['pnl']+=pnl
-        trade=dict(id=totals['trades'],account_id=a['id'],phase=phase,symbol=c['symbol'],side='buy' if p['direction']>0 else 'sell',quantity=p['quantity'],
+        trade=dict(id=totals['trades'],account_id=a['id'],phase=phase,symbol=c['symbol'],side='buy' if p['direction']>0 else 'sell',quantity=p['quantity'],batch_number=p['batch_number'],
             opened_at=p['opened_at'],closed_at=ts,entry_price=p['entry_price'],exit_price=exit_price,gross_pnl=round(gross,8),fees=round(p['entry_fee']+fee,8),
             slippage_mode=c['slippage_mode'],fixed_slippage_usd=round(p['entry_slippage']+fixed_slippage,8),
             funding=round(p['funding'],8),pnl=round(pnl,8),is_win=pnl>0,stop_loss=p['stop_loss'],remaining_drawdown=p['remaining_drawdown'],reason=reason,holding_seconds=held)
@@ -190,9 +190,11 @@ def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
                         j=i-fresh_available;a=active[ready[j]];old.append(j)
                     batch.append(a)
                 unused.discard(fresh);remove_ready(old);queue=sorted(batch,key=lambda a:0 if a['phase']==2 else 1);next_order=now
+                batch_side=choose_batch_side(c['strategy_id'],rng,[c['side']])
+                batch_number+=1
         while queue and now>=next_order:
             a=queue.pop(0);reset_risk(a,risk_day)
-            direction=1 if choose_side(c['strategy_id'],rng,c['side'])=='buy' else -1;entry=fill(b['open'],direction)
+            direction=1 if batch_side=='buy' else -1;entry=fill(b['open'],direction)
             q=(a['balance']*c['size_percent']/100-fixed_slippage)/(entry*pv*(1/c['leverage']+rate))
             q=math.floor(q) if c['sizing']=='micro_contracts' else math.floor(q*10000)/10000
             a['last_entry'][a['phase']]=day;a['used'].add(a['phase'])
@@ -202,7 +204,7 @@ def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
                 remaining=a['balance']-(capital-c['max_drawdown'])
                 stop=None if c['skip_stop_loss_on_low_drawdown'] and remaining<c['drawdown_stop_loss_threshold'] else c['stop_loss']
                 fee=entry*q*pv*rate;a['balance']-=fee+fixed_slippage;totals['fees']+=fee;totals['fixed_slippage']+=fixed_slippage
-                a['position']=dict(entry_price=entry,quantity=q,direction=direction,entry_fee=fee,entry_slippage=fixed_slippage,funding=0.,opened_at=now,stop_loss=stop,remaining_drawdown=remaining)
+                a['position']=dict(entry_price=entry,quantity=q,direction=direction,batch_number=batch_number,entry_fee=fee,entry_slippage=fixed_slippage,funding=0.,opened_at=now,stop_loss=stop,remaining_drawdown=remaining)
                 positions[a['id']]=a;a['phase_records'][PHASES[a['phase']]]['trades']+=1;stages[PHASES[a['phase']]]['trades']+=1
             next_order=now+rng.uniform(c['order_delay_min'],c['order_delay_max'])
         for a in tuple(positions.values()):
@@ -270,7 +272,7 @@ def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
         total_holding_seconds=sum(r['holding'] for r in stages.values()),closed_trades=totals['trades'],
         avg_holding_seconds=sum(r['holding'] for r in stages.values())/totals['trades'] if totals['trades'] else None)
     progress(dict(completed=len(bars),total=len(bars),trades=totals['trades'],accounts=totals['created'],active_positions=0))
-    result=dict(config=c,simulation_version=9,time_statistics=time_stats.result(totals['trades'],bars[0]['time'],end),strategy_version=require_strategy(c['strategy_id'])['version'],metrics=metrics,stages=stage_metrics,curve=curve,
+    result=dict(config=c,simulation_version=10,time_statistics=time_stats.result(totals['trades'],bars[0]['time'],end),strategy_version=require_strategy(c['strategy_id'])['version'],metrics=metrics,stages=stage_metrics,curve=curve,
         randomness=dict(algorithm=c['rng_algorithm'],seed=c['seed'],seed_policy=c['seed_policy'],
             seed_bits=128 if isinstance(c['seed'],str) else 32,sampler_version=1,library_version=getattr(rng,'library_version',None)),
         settlement=dict(policy='settle_submitted_claims',trading_end=end,settlement_end=settlement_end,
@@ -283,6 +285,7 @@ def simulate(raw,bars,instrument,progress=lambda d:None,*,detail_sink=None):
             source=instrument.get('source_description','NT8 本地历史缓存'),continuous=bool(instrument.get('continuous')),
             adjustment=instrument.get('adjustment'),source_url=instrument.get('source_url'),source_commit=instrument.get('source_commit')),
         sources=RULE_SOURCES,assumptions=[
+            '同一批账号在同一品种上统一方向；随机方向每批仅抽取一次，账号之间的下单间隔不重新抽取方向。',
             'CME 月份合约作为 Vest 永续价格代理；不拼接、不补造缺口，不能重建基差、盘口深度或真实排队。',
             '市价单开平仓均扣单边手续费并承受不利滑点；费用和滑点参数及来源随结果保存。',
             'tick 滑点体现在成交价格；USD 滑点按整笔订单每边固定金额单独扣减，开仓预留，平仓及达标计算包含该成本，不随数量放大。',

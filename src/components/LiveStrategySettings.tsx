@@ -26,7 +26,7 @@ export default function LiveStrategySettings({value, onChange}: {
     <label className="field"><span className="field-label">Live 下单方向</span>
       <select aria-label="Live 下单方向" value={value.live_side} onChange={e => onChange({live_side:e.target.value as LiveStrategyConfig['live_side']})}>
         <option value="random">随机做多 / 做空</option><option value="buy">只做多</option><option value="sell">只做空</option>
-      </select></label>
+      </select><small>与考核号同批时，遵守同品种统一方向规则。</small></label>
     <div className="field"><span className="field-label" id="live-size-label">Live 仓位大小</span>
       <div className="position-size-options" role="group" aria-labelledby="live-size-label">{[25,50,75,100].map(percent =>
         <button key={percent} type="button" aria-label={`Live 仓位大小 ${percent}%`} aria-pressed={value.live_size_percent===percent}
