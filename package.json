@@ -15,6 +15,8 @@
     "test:extension:browser": "node scripts/extension-browser-smoke.mjs",
     "test:browser": "node scripts/browser-smoke.mjs",
     "test:strategy:browser": "node scripts/strategy-browser-smoke.mjs",
+    "test:terminal:browser": "node scripts/terminal-browser-smoke.mjs",
+    "test:live:browser": "node scripts/live-browser-smoke.mjs",
     "test:backtest:browser": "node scripts/backtest-browser-smoke.mjs",
     "package:extension": "node scripts/package-extension.mjs"
   },

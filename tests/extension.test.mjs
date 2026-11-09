@@ -8,6 +8,31 @@ vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(new URL('../extension/core.js', import.meta.url), 'utf8'), sandbox);
 const { parseMoney, positionState, parseSide, sameQuantity, matchesPosition, validateJob, defaults } = sandbox.VestBridgeCore;
 
+test('Live activation notice requires both completed evaluation and explicitly live account text',()=>{
+  const parse=sandbox.VestBridgeCore.liveActivationNotice;
+  const zh='恭喜 - 您已通过评估阶段。\n您的 $5,000 Funded Account 现已转为实盘。';
+  const en="Congratulations - you've passed the Evaluation Phase. Your $10,000 Funded Account is now live.";
+  assert.equal(parse('评估通过',zh),true);assert.equal(parse('Evaluation Passed',en),true);
+  for(const [title,description] of [['付款完成',zh],['第 1 阶段已完成！',zh],['评估通过','请购买新的 Funded Account'],['Evaluation Passed',en.replace('is now live','may become live')]])assert.equal(parse(title,description),false);
+});
+
+test('terminal notice classification requires an observed closure, not a risk warning or paid retry',()=>{
+  const parse=sandbox.VestBridgeCore.terminalNoticeReason;
+  assert.equal(parse('您的每日亏损额度已用完','您的账户已触及每日亏损上限，现已关闭。请查看下方交易，或购买新的 Funded Account。'),'daily_loss');
+  assert.equal(parse('Your daily loss limit has been reached','Your account has reached its daily loss limit and is now closed.'),'daily_loss');
+  assert.equal(parse('Your Daily Loss Ran Out','Your account has reached its Daily Loss Limit and is now closed. Review the trades below, or purchase a new Funded Account.'),'daily_loss');
+  assert.equal(parse('Your Drawdown Ran Out','Your account has reached its Drawdown Limit and is now closed.'),'max_drawdown');
+  assert.equal(parse('您的回撤额度已用完','您的账户已触及回撤上限，现已关闭。'),'max_drawdown');
+  assert.equal(parse('Account closed','Your account has been closed after reaching maximum drawdown.'),'max_drawdown');
+  for(const [title,description] of [
+    ['Risk warning','Your account may be closed if the daily loss limit is reached.'],
+    ['您的每日亏损额度已用完','您的账户即将关闭，请确认风险。'],
+    ['Confirm order','Your account has been closed after reaching the daily loss limit.'],
+    ['Your daily loss limit has been reached','Your account is still active.'],
+    ['Retry - $14.25','Your account has been closed after reaching the daily loss limit.'],
+  ]) assert.equal(parse(title,description),null,title);
+});
+
 test('strategy stop loss uses a fresh drawdown pair and a strict less-than boundary', () => {
   const decide=sandbox.VestBridgeCore.strategyStopLoss;
   const job={source:'strategy',stop_loss:130,skip_stop_loss_on_low_drawdown:true,drawdown_stop_loss_threshold:200};

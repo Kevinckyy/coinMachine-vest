@@ -73,6 +73,18 @@
     if (found.includes('failed') && found.length===2 && found.some(state=>['eval','funded'].includes(state))) return 'failed';
     return found.length === 1 ? found[0] : null;
   }
+  function terminalNoticeReason(title, description) {
+    const heading=normalized(title), detail=normalized(description);
+    // These are completed account-closure notices, never prospective risk warnings.
+    const knownHeading=/^(?:您的每日亏损额度已用完|您的每日虧損額度已用完|您的回撤额度已用完|您已触及每日亏损上限|您的账户已关闭|您的帳戶已關閉|Your (?:daily loss|drawdown) ran out|Your daily loss (?:limit|allowance) (?:has been (?:reached|exceeded|exhausted)|is exhausted)|Daily loss limit (?:reached|exceeded)|Maximum drawdown (?:reached|exceeded)|Account closed|Your account (?:has been|is) closed)$/i;
+    if (!knownHeading.test(heading)) return null;
+    const closed=/(?:账户|帳戶).{0,80}(?:已关闭|已關閉)|\byour account\b.{0,100}\b(?:has (?:now )?been closed|is (?:now )?closed)\b/i.test(detail);
+    if (!closed) return null;
+    const text=heading+' '+detail;
+    if (/每日(?:亏损|虧損)|daily loss/i.test(text)) return 'daily_loss';
+    if (/回撤(?:上限|额度)|maximum drawdown|max[.]? drawdown|drawdown (?:limit|ran out)/i.test(text)) return 'max_drawdown';
+    return null;
+  }
   function positionState(openVisible, emptyVisible) {
     return openVisible === emptyVisible ? null : openVisible;
   }
@@ -153,5 +165,9 @@
     const remaining = Math.round((metric.limit-metric.current)*1e8)/1e8;
     return {stop_loss:remaining < job.drawdown_stop_loss_threshold ? null : configured,remaining_drawdown:remaining,drawdown:metric};
   }
-  root.VestBridgeCore = { FIELDS, defaults, parseMoney, normalized, isNqTradePath, canonicalNqPosition, CAPITAL_INDICATORS, parseCapitalMetric, accountCategory, accountPhase, positionState, parseSide, sameQuantity, nqInputToVest, nqVestToInput, matchesPosition, executionExcluded, assertExecutionAllowed, validateJob, strategyStopLoss };
+  function liveActivationNotice(title, description) {
+    if (!/^(?:评估通过|Evaluation Passed)$/i.test(normalized(title))) return false;
+    return /^(?:恭喜\s*-\s*您已通过评估阶段。\s*您的\s*\$[\d,]+(?:\.\d+)?\s*Funded Account\s*现已转为实盘。|Congratulations\s*-\s*you've passed the Evaluation Phase\.\s*Your\s+\$[\d,]+(?:\.\d+)?\s+Funded Account is now live\.)$/i.test(normalized(description));
+  }
+  root.VestBridgeCore = { FIELDS, defaults, parseMoney, normalized, isNqTradePath, canonicalNqPosition, CAPITAL_INDICATORS, parseCapitalMetric, accountCategory, terminalNoticeReason, liveActivationNotice, accountPhase, positionState, parseSide, sameQuantity, nqInputToVest, nqVestToInput, matchesPosition, executionExcluded, assertExecutionAllowed, validateJob, strategyStopLoss };
 })(globalThis);

@@ -120,6 +120,72 @@ test('the single execute toggle automatically uses discovered accounts without a
   assert.ok(modeMessages(h).some(message => message.mode === 'execute' && message.accounts?.length === 2));
 });
 
+test('Live activation is reserved once and only for the current authorized second-stage account',async t=>{
+  const h=harness(t);await mode(h,'execute');
+  const control=(await h.dispatch({type:'control-status',tabId:42})).data;
+  h.state.local['observation:42'].registrations[0].phase='2/2';
+  const message={type:'live-activation-reserve',account_id:automatic[0].id,name:automatic[0].name,mode_epoch:control.mode_epoch};
+  assert.equal((await h.dispatch({...message,mode_epoch:control.mode_epoch-1},pageSender)).ok,false);
+  assert.equal((await h.dispatch({...message,name:'Other'},pageSender)).ok,false);
+  const first=await h.dispatch(message,pageSender);assert.equal(first.ok,true,first.error);
+  assert.equal(first.data.status,'pending');
+  const second=await h.dispatch(message,pageSender);assert.equal(second.data.duplicate,true);
+  assert.equal(second.data.started_at,first.data.started_at);
+  h.state.local['observation:42'].registrations[1].phase='2/2';
+  const other={...message,account_id:automatic[1].id,name:automatic[1].name};
+  const pair=await Promise.all([h.dispatch(other,pageSender),h.dispatch(other,pageSender)]);
+  assert.equal(pair.filter(r=>r.ok&&!r.data.duplicate).length,1,'concurrent reservations must only reserve once');
+  assert.equal(pair.filter(r=>r.ok&&r.data.duplicate).length,1);
+  const requestCount=h.state.requests.length;
+  h.state.tabUrls[42]='https://next.vestmarkets.com/portfolio';
+  const portfolio={...pageSender,url:'https://next.vestmarkets.com/portfolio',tab:{id:42,url:'https://next.vestmarkets.com/portfolio'}};
+  const heartbeat=await h.dispatch({type:'mode-heartbeat'},portfolio);
+  assert.equal(heartbeat.data.mode,'execute');assert.equal(heartbeat.data.phase_activation_pending,true);
+  assert.equal(h.state.requests.length,requestCount,'Portfolio must not send a fictitious NQ heartbeat');
+  assert.equal((await h.dispatch({type:'execution-next'},portfolio)).ok,false,'Portfolio never dispatches');
+  h.state.local['live-activation-tab:42'].started_at=Date.now()-21000;
+  assert.equal((await h.dispatch({type:'mode-heartbeat'},portfolio)).ok,false,'bounded transition cannot keep permission indefinitely');
+  h.state.tabUrls[42]=URL_VEST;
+  const complete={...message,type:'live-activation-complete'};
+  assert.equal((await h.dispatch(complete,pageSender)).ok,false,'completion requires backend Live confirmation');
+  h.state.local['observation:42'].registrations[0].phase='live';
+  assert.equal((await h.dispatch(complete,pageSender)).ok,true);
+  assert.equal(h.state.local['live-activation-tab:42'],null);
+  await mode(h,'readonly');
+  assert.equal((await h.dispatch(message,pageSender)).ok,false,'read-only cannot activate');
+});
+
+test('a delayed actor-restore heartbeat cannot borrow the new preflight epoch and revoke execute',async t=>{
+  const h=harness(t);
+  const startRestore=deferred(),grantReached=deferred(),allowGrant=deferred(),oldReached=deferred(),allowOld=deferred();
+  t.after(()=>{startRestore.resolve();allowGrant.resolve();allowOld.resolve();});
+  const original=h.sandbox.sessionRequest;
+  let captured=false;
+  h.sandbox.sessionRequest=async(tabId,options={})=>{
+    if(!captured&&options.heartbeat_only&&!options.authorize){captured=true;await startRestore.promise;}
+    return original(tabId,options);
+  };
+  h.state.fetchHandler=async request=>{
+    if(!request.url.endsWith('/api/bridge/session'))return;
+    if(request.body.authorize){grantReached.resolve();await allowGrant.promise;}
+    else if(request.body.mode==='readonly'){oldReached.resolve(request.body);await allowOld.promise;}
+  };
+  const restored=await h.dispatch({type:'observation-restore'},pageSender);
+  assert.equal(restored.data.mode,'readonly');
+  const enabling=mode(h,'execute');
+  await grantReached.promise;
+  startRestore.resolve();
+  const oldBody=await oldReached.promise;
+  allowGrant.resolve();
+  const granted=await enabling;
+  assert.equal(granted.data.mode,'execute');
+  allowOld.resolve();
+  for(let i=0;i<12;i++)await flush();
+  assert.equal(oldBody.mode_epoch,restored.data.mode_epoch,'restore must retain its old epoch even while a newer readonly preflight exists');
+  assert.equal(h.state.session['control-mode:42'].mode,'execute');
+  assert.equal(h.state.backend.get(granted.data.session_id).mode,'execute');
+});
+
 test('read-only revokes the local actor before waiting for an HTTP acknowledgement', async t => {
   const h = harness(t);
   assert.equal((await mode(h, 'execute')).ok, true);

@@ -90,7 +90,7 @@
         <td><a href="https://next.vestmarkets.com/trade/NQ-PERP"><p data-testid="position-symbol-${id}">NQ</p><p data-testid="position-side-${id}">${side === 'buy' ? 'Long' : 'Short'} 10x</p></a></td>
         <td data-testid="td-value"><div><p><span data-testid="position-value-${id}">$40,200.00</span></p><p>${quantity.toFixed(4)} NQ</p></div></td>
         <td><span data-testid="position-entry-${id}">$20,100.00</span></td>
-        <td data-testid="td-tpsl"><div><span>${withTP ? '<span class="text-long">'+(side === 'buy' ? '$20,150.00' : '$20,050.00')+'</span>' : '—'} / ${withSL ? '<span class="text-short">'+(side === 'buy' ? '$20,075.00' : '$20,125.00')+'</span>' : '—'}</span></div></td>
+        <td data-testid="td-tpsl"><div><span><span class="text-long">${withTP ? (side === 'buy' ? '$20,150.00' : '$20,050.00') : '-'}</span> / <span class="text-short">${withSL ? (side === 'buy' ? '$20,075.00' : '$20,125.00') : '-'}</span></span></div></td>
         <td><button data-testid="position-close-${id}">Close</button></td>
       </tr></tbody></table>`;
     el('position-close-' + id).onclick = () => {

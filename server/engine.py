@@ -30,7 +30,10 @@ NQ_TRADE_PATHS = {'/trade/NQ-PERP','/trade/NDX-USD-PERP'}
 STRATEGY_FORM_DEFAULTS = dict(strategy_id='random_entry',batch_size=2, order_delay_min=2, order_delay_max=8,
     batch_delay_min=15, batch_delay_max=45, size_percent=25, take_profit=None,
     stop_loss=130, side='random', symbol='NQ-PERP',
-    skip_stop_loss_on_low_drawdown=False, drawdown_stop_loss_threshold=200)
+    skip_stop_loss_on_low_drawdown=False, drawdown_stop_loss_threshold=200,
+    live_default_locked=True, live_side='random', live_size_percent=25,
+    live_take_profit=None, live_stop_loss=130,
+    live_skip_stop_loss_on_low_drawdown=False, live_drawdown_stop_loss_threshold=200)
 
 class ValidationError(ValueError):
     def __init__(self, message, status=400):
@@ -495,12 +498,32 @@ class Engine(PhaseAccounting):
             if account.get('merged_into') or execution_excluded(account):
                 continue
             locked_at = number(account.get('strategy_locked_at'))
-            if account.get('strategy_locked') and locked_at is not None and locked_at < day_start:
+            if account.get('strategy_locked') and account.get('strategy_lock_source')!='live_default' and locked_at is not None and locked_at < day_start:
                 account.update({'strategy_locked':False,'strategy_lock_reason':None,
                                 'strategy_lock_source':None,'strategy_locked_at':None})
                 self._log('info',f"{account['name']} 新交易日已自动解除策略锁定；账户风控及平台状态保持不变")
                 changed = True
+        for account in self.data['accounts'].values():
+            changed = self._apply_live_strategy_default(account) or changed
         return changed
+
+    @staticmethod
+    def _is_live_account(account):
+        return account.get('phase')=='live' or account.get('category')=='live'
+
+    def _apply_live_strategy_default(self, account):
+        if (not self._is_live_account(account) or account.get('merged_into') or execution_excluded(account)
+            or account.get('retired_failed') or account.get('archived')):
+            return False
+        enabled=self.data.get('preferences',{}).get('strategy_config',{}).get('live_default_locked',True)
+        if not enabled and account.get('strategy_lock_source')=='live_default':
+            account.update(strategy_locked=False,strategy_lock_reason=None,strategy_lock_source=None,strategy_locked_at=None)
+            self._log('info',f"{account['name']} 已取消 Live 默认锁定；不会自动加入当前批次")
+            return True
+        if enabled and not account.get('live_default_lock_exempt') and not account.get('strategy_locked'):
+            self._lock_strategy(account,'Live 账户默认锁定，可逐个手动解锁','live_default')
+            return True
+        return False
 
     def _lock_strategy(self, account, reason, source, *, new_event=False):
         """Exclude future strategy entries without stopping position protection."""
@@ -518,7 +541,7 @@ class Engine(PhaseAccounting):
                 return
         priority = {'manual':0,'external_close':1,'daily_completed':1,'take_profit':2,'stop_loss':2,'target_reached':2,'evaluation_passed':3}
         existing = account.get('strategy_lock_source')
-        if account['strategy_locked'] and priority.get(existing,0) >= priority.get(source,0):
+        if account['strategy_locked'] and priority.get(existing,0) >= priority.get(source,0) and not (existing=='live_default' and source=='manual'):
             return
         account.update({'strategy_locked':True,'strategy_lock_reason':reason,
                         'strategy_lock_source':source,'strategy_locked_at':self.clock()})
@@ -547,12 +570,14 @@ class Engine(PhaseAccounting):
             self._assert_execution_allowed(account)
             self._strategy_lock_defaults(account)
             if locked:
+                if self._is_live_account(account):account['live_default_lock_exempt']=False
                 self._lock_strategy(account,'手动排除自动策略','manual')
             else:
                 if account.get('status')=='passed' or account.get('category')=='passed':
                     raise ValidationError('账户已通过评估，不能重新加入自动策略')
                 account.update({'strategy_locked':False,'strategy_lock_reason':None,
                                 'strategy_lock_source':None,'strategy_locked_at':None})
+                if self._is_live_account(account):account['live_default_lock_exempt']=True
                 self._log('info',f"{account['name']} 已解除策略锁定；不会自动加入正在运行的批次")
             self._save()
             return copy.deepcopy(account)
@@ -631,14 +656,17 @@ class Engine(PhaseAccounting):
                     and aid in execution.get('account_ids',[])
                     and account.get('initial_balance') is not None)
 
-    def _eligible(self, aid, *, live_ready=True, for_strategy=False):
+    def _eligible(self, aid, *, live_ready=True, for_strategy=False, live_default_locked=None):
         if self._roll_strategy_locks():
             self._save()
         account = self._account(aid)
         self._assert_execution_allowed(account)
         if account.get('phase_pending'):
             raise ValidationError('阶段切换同步中，等待明确空仓读数')
-        if for_strategy and account.get('strategy_locked'):
+        locked=account.get('strategy_locked')
+        if live_default_locked is False and account.get('strategy_lock_source')=='live_default':locked=False
+        if live_default_locked is True and self._is_live_account(account) and not account.get('live_default_lock_exempt'):locked=True
+        if for_strategy and locked:
             raise ValidationError(f"{account['name']} 已锁定，不参与自动策略")
         if account['mode'] != self.data['mode']:
             raise ValidationError('模拟账户与浏览器账户不可混用')
@@ -699,6 +727,23 @@ class Engine(PhaseAccounting):
                 raise ValidationError('回撤止损规则仅支持按仓位比例执行的策略')
             policy = dict(strategy_id=body.get('strategy_id','random_entry'),skip_stop_loss_on_low_drawdown=enabled,
                 drawdown_stop_loss_threshold=positive(body.get('drawdown_stop_loss_threshold',200),'剩余最大回撤阈值'))
+            for key in ('live_default_locked','live_skip_stop_loss_on_low_drawdown'):
+                value=body.get(key,STRATEGY_FORM_DEFAULTS[key])
+                if not isinstance(value,bool):raise ValidationError('Live 策略开关必须是布尔值')
+                policy[key]=value
+            live_side=body.get('live_side','random')
+            if live_side not in ('random','buy','sell'):raise ValidationError('Live 下单方向无效')
+            pct=body.get('live_size_percent',25)
+            if isinstance(pct,bool) or pct not in (25,50,75,100):raise ValidationError('Live 仓位大小只能选择 25%、50%、75% 或 100%')
+            if policy['live_skip_stop_loss_on_low_drawdown'] and 'size_percent' not in sizing:
+                raise ValidationError('Live 回撤止损规则仅支持按仓位比例执行的策略')
+            policy.update(live_side=live_side,live_size_percent=int(pct),
+                live_drawdown_stop_loss_threshold=positive(body.get('live_drawdown_stop_loss_threshold',200),'Live 剩余最大回撤阈值'))
+            for key,label,default in (('live_take_profit','Live 止盈金额',None),('live_stop_loss','Live 止损金额',130)):
+                value=body.get(key,default)
+                policy[key]=None if value is None else positive(value,label)
+            if policy['live_skip_stop_loss_on_low_drawdown'] and policy['live_stop_loss'] is None:
+                raise ValidationError('Live 低回撤止损规则需要先填写止损金额')
         return {'symbol': 'NQ-PERP', 'side': side, **sizing, **policy,
                 'take_profit': positive(body['take_profit'], '止盈金额') if body.get('take_profit') is not None else None,
                 'stop_loss': positive(body.get('stop_loss',130), '止损金额')}
@@ -721,6 +766,7 @@ class Engine(PhaseAccounting):
         with self.lock:
             cfg = self._strategy_form_config({**self.data['preferences']['strategy_config'],**body})
             self.data['preferences']['strategy_config'] = cfg
+            self._roll_strategy_locks()
             self._save()
             return copy.deepcopy(cfg)
 
@@ -978,13 +1024,14 @@ class Engine(PhaseAccounting):
             if self.data['strategy']['status'] in self.ACTIVE:
                 raise ValidationError('策略已运行', 409)
             self._assert_settled_browser_actions()
-            cfg = self._order_config(body, strategy=True)
+            live_saved={k:v for k,v in self.data['preferences']['strategy_config'].items() if k.startswith('live_')}
+            cfg = self._order_config({**live_saved,**body}, strategy=True)
             ids = self._ids(body.get('account_ids'))
             n = body.get('batch_size')
             if isinstance(n, bool) or not isinstance(n, (int,float)) or not math.isfinite(n) or int(n)!=n or not 1 <= n <= len(ids):
                 raise ValidationError('每批账户数量必须为正整数且不超过所选账户数')
             for aid in ids:
-                self._eligible(aid,for_strategy=True)
+                self._eligible(aid,for_strategy=True,live_default_locked=cfg['live_default_locked'])
             cfg.update({'account_ids': list(ids), 'batch_size': int(n)})
             for field in ('order_delay_min','order_delay_max','batch_delay_min','batch_delay_max'):
                 cfg[field] = nonnegative(body.get(field), field)
@@ -995,6 +1042,7 @@ class Engine(PhaseAccounting):
                 'next_action_at': self.clock(), 'config': cfg, 'phase': 'next_batch', 'order_queue': [],
                 'upcoming_account_ids':[], 'preparation':{'status':'disabled','accounts':{}}}
             self.data['preferences']['strategy_config'] = self._strategy_form_config(cfg)
+            self._roll_strategy_locks()
             self._log('success', f"随机策略启动：每批 {n} 个账户；账户池使用一次后结束")
             self._save()
             return copy.deepcopy(self.data['strategy'])
@@ -1089,7 +1137,13 @@ class Engine(PhaseAccounting):
             if self._account(aid).get('phase_pending'):
                 return
             order_cfg = {k: cfg[k] for k in ('symbol','quantity','size_percent','take_profit','stop_loss','skip_stop_loss_on_low_drawdown','drawdown_stop_loss_threshold') if k in cfg}
-            order_cfg['side'] = choose_side(cfg.get('strategy_id','random_entry'),self.rng,cfg['side'])
+            direction=cfg['side']
+            if self._is_live_account(self._account(aid)):
+                for key in ('take_profit','stop_loss','skip_stop_loss_on_low_drawdown','drawdown_stop_loss_threshold'):
+                    order_cfg[key]=cfg.get('live_'+key,STRATEGY_FORM_DEFAULTS['live_'+key])
+                if 'size_percent' in order_cfg:order_cfg['size_percent']=cfg.get('live_size_percent',25)
+                direction=cfg.get('live_side','random')
+            order_cfg['side'] = choose_side(cfg.get('strategy_id','random_entry'),self.rng,direction)
             try:
                 self._open_one(aid, order_cfg, 'strategy')
             except ValidationError as exc:
@@ -1174,6 +1228,8 @@ class Engine(PhaseAccounting):
                 'side': raw.get('side') if raw.get('side') in ('buy','sell') else None,
                 'symbol': raw.get('symbol') if isinstance(raw.get('symbol'),str) else None,
                 'position_id': str(raw.get('position_id'))[:160] if raw.get('position_id') else None,
+                **{key:raw[key] for key in ('native_sl','native_tp','native_sl_absent') if isinstance(raw.get(key),bool)},
+                **{key:number(raw[key]) for key in ('native_sl_price','native_tp_price') if key in raw},
                 'unrealized_pnl': number(raw.get('unrealized_pnl')),
                 'price': number(raw.get('price')), 'position_open': raw.get('position_open') if isinstance(raw.get('position_open'), bool) else None,
                 'observed_at': observed_time(raw.get('observed_at'))}
@@ -1617,7 +1673,16 @@ class Engine(PhaseAccounting):
             fresh_authorization = authorize and epoch>prior_epoch
             mode = 'execute' if requested=='execute' and (continuing or fresh_authorization) else 'readonly'
             if session.get('mode')=='execute' and mode=='readonly':
-                self._revoke_execution(session,'插件执行检查失败：'+execution_error if execution_error else '插件已切换只读模式')
+                source=body.get('revocation_source')
+                reason=('插件执行检查失败：'+execution_error if execution_error else
+                        '页面刷新或脚本重新连接，执行已切回只读' if source=='page-actor-restore' else
+                        '执行授权轮次不一致，已切回只读' if requested=='execute' else '插件已切换只读模式')
+                self.data['audit'].append({'event':'execution_permission_revoked','time':now,
+                    'session_id':sid,'previous_epoch':prior_epoch,'requested_epoch':epoch,
+                    'requested_mode':requested,'source':source if source=='page-actor-restore' else 'mode-request',
+                    'error':execution_error})
+                self.data['audit']=self.data['audit'][-1000:]
+                self._revoke_execution(session,reason)
             if execution_error and mode=='readonly':
                 session['error'] = execution_error
             elif fresh_authorization and mode=='execute':
@@ -1895,7 +1960,9 @@ class Engine(PhaseAccounting):
             if job['status'] != 'delivered':
                 raise ValidationError('操作结果已不再接受；请人工核对账户', 409)
             snapshot = self._snapshot(body.get('snapshot'))
-            if job.get('phase') and snapshot.get('phase')!=job['phase']:
+            unconfirmed_without_phase = (snapshot.get('phase') is None and
+                (body.get('success') is not True or body.get('confirmed') is not True))
+            if job.get('phase') and snapshot.get('phase')!=job['phase'] and not unconfirmed_without_phase:
                 raise ValidationError('回执阶段与原订单不同，请先同步当前阶段',409)
             complete = (all(number(snapshot.get(k)) is not None for k in ('balance','unrealized_pnl','price'))
                         and snapshot['price'] > 0 and abs(self.clock()-snapshot['observed_at']) <= 5)
@@ -2081,6 +2148,91 @@ class Engine(PhaseAccounting):
         self._save()
         return {'ok':True,'terminal_status':'failed','archived_jobs':count}
 
+    def _adopt_verified_position(self, account, body):
+        """Explicitly adopt observed exposure; never replay or confirm an unknown fill."""
+        aid=account['id'];self._assert_execution_allowed(account)
+        if self.data['strategy']['status'] in self.ACTIVE:
+            raise ValidationError('请先暂停策略再核对接管现有持仓',409)
+        job=self.data['jobs'].get(body.get('job_id'))
+        if not job or job.get('account_id')!=aid or job.get('type')!='open':
+            raise ValidationError('需要该账户原有的开仓请求',409)
+        position=self._position(aid)
+        if (job.get('resolution')=='adopted_observed_position' and position and
+            position.get('browser_position_id')==body.get('position_id')):
+            return {'ok':True,'adopted':True,'duplicate':True,'position_id':position['id']}
+        if position or job.get('status')!='unknown' or job.get('delivered_at') is None:
+            raise ValidationError('仅支持接管唯一已送达但结果未知的开仓请求',409)
+        if account.get('phase_pending') or (job.get('phase') and job['phase']!=account.get('phase')):
+            raise ValidationError('原请求与当前账户阶段不符，不能接管',409)
+        pending=self._pending(aid)
+        if len(pending)!=1 or pending[0]['id']!=job['id']:
+            raise ValidationError('该账户还有其他未确认操作，不能接管',409)
+        session=self.data['bridge_sessions'].get(aid,{})
+        owner=self.data['execution_sessions'].get(account.get('session_id'),{})
+        if (session.get('source')!='readonly-inspection' or owner.get('mode')!='readonly' or
+            session.get('session_id')!=job.get('session_id') or not self._fresh(aid)):
+            raise ValidationError('需要同一执行窗口在只读模式下提供5秒内的完整持仓核对读数',409)
+        snapshot=session['snapshot']
+        if (snapshot.get('position_open') is not True or not body.get('position_id') or
+            snapshot.get('position_id')!=body['position_id'] or snapshot.get('symbol')!=job['symbol'] or
+            snapshot.get('side')!=job['side'] or number(job.get('quantity')) is None or
+            number(snapshot.get('quantity')) is None or not math.isclose(snapshot['quantity'],job['quantity'],rel_tol=1e-9,abs_tol=1e-9) or
+            not snapshot.get('entry_price') or snapshot['entry_price']<=0 or snapshot.get('equity') is None or
+            abs(snapshot['equity']-snapshot['balance']-snapshot['unrealized_pnl'])>.03):
+            raise ValidationError('实际持仓ID、品种、方向、数量、阶段或资金与待核对请求不符',409)
+        stop_ok=snapshot.get('native_sl_absent') is True if job.get('stop_loss') is None else snapshot.get('native_sl') is True
+        tp_ok=(snapshot.get('native_tp') is False and snapshot.get('native_tp_price') is None) if job.get('take_profit') is None else snapshot.get('native_tp') is True
+        if not stop_ok or not tp_ok:
+            raise ValidationError('无法核对原策略要求的原生止盈止损状态，不能接管',409)
+        now=self.clock();original=copy.deepcopy(job)
+        keys=('symbol','side','quantity','take_profit','stop_loss','size_percent','configured_stop_loss',
+              'skip_stop_loss_on_low_drawdown','drawdown_stop_loss_threshold','stop_loss_omitted','remaining_drawdown_at_entry')
+        position={'id':uuid.uuid4().hex,'account_id':aid,'account_name':account['name'],'phase':job.get('phase'),
+            **{key:job[key] for key in keys if key in job},'entry_price':snapshot['entry_price'],
+            'mark_price':snapshot['price'],'unrealized_pnl':snapshot['unrealized_pnl'],
+            'opened_at':now,'opened_at_source':'verified_existing_position_observation',
+            'order_delivered_at':job['delivered_at'],'source':job['source'],'mode':'browser','status':'open',
+            'balance_before':job.get('balance_before',snapshot['balance']),
+            'price_source':'observed_entry','browser_position_id':snapshot['position_id'],'reconciled_position':True}
+        self.data['positions'][position['id']]=position
+        job.update(status='reconciled',original_status='unknown',reconciled_at=now,
+                   resolution='adopted_observed_position',local_position_id=position['id'])
+        account.update(status='active',lock_reason=None,external_position=False)
+        self.data['audit'].append({'event':'manual_position_adoption','time':now,'account_id':aid,
+            'account_name':account['name'],'original_job':original,'observed_snapshot':copy.deepcopy(snapshot),
+            'position_id':position['id'],'acknowledgement':'明确核对现有持仓并接管；原请求留为已核对而非确认成交，不重放订单或补造历史，开仓时间记为接管观察时间'})
+        self.data['audit']=self.data['audit'][-1000:]
+        self._log('warning',f"{account['name']} 已核对并接管现有持仓；原开仓请求未重发，策略保持暂停")
+        self._save()
+        return {'ok':True,'adopted':True,'position_id':position['id'],'status':account['status']}
+
+    def resume_strategy(self, body):
+        """Explicitly resume the same monitoring batch or its cooldown."""
+        with self.lock:
+            s=self.data['strategy']
+            if body.get('acknowledge') is not True or not body.get('run_id') or body['run_id']!=s.get('run_id'):
+                raise ValidationError('需要明确确认继续当前这一轮策略',409)
+            if s['status']!='paused' or s.get('phase') not in ('monitoring','cooldown') or s.get('order_queue'):
+                raise ValidationError('当前状态不能继续原监控批次，请核对后重新启动策略',409)
+            self._assert_settled_browser_actions()
+            for aid in s.get('remaining_accounts',[]):self._eligible(aid,for_strategy=True)
+            for aid in s.get('batch_account_ids',[]):
+                position=self._position(aid)
+                if position and position['mode']=='browser':
+                    if not self._execution_capable(aid) or not self._fresh(aid) or not self._matches_position(position,self.data['bridge_sessions'][aid]['snapshot']):
+                        raise ValidationError('当前批次持仓尚未恢复执行或缺少新鲜核对读数',409)
+            if s['phase']=='cooldown':
+                if any(self._position(aid) for aid in s.get('batch_account_ids',[])):
+                    raise ValidationError('批间等待状态仍有持仓，不能提前开始下一批',409)
+                cfg=s['config'];s.update(status='waiting',next_action_at=self.clock()+self.rng.uniform(cfg['batch_delay_min'],cfg['batch_delay_max']))
+            else:
+                s.update(status='running',next_action_at=None)
+            self.data['audit'].append({'event':'manual_strategy_resume','time':self.clock(),'run_id':s['run_id'],
+                'phase':s['phase'],'acknowledgement':'明确继续同一轮策略；参数、当前批次、每日额度及剩余账户保持不变'})
+            self.data['audit']=self.data['audit'][-1000:]
+            self._log('success','原策略已继续：保留当前批次和持仓，按原参数处理剩余账户')
+            self._save();return copy.deepcopy(s)
+
     def reconcile(self, body):
         """Explicit human verification of flatness or terminal evaluation failure.
 
@@ -2094,6 +2246,10 @@ class Engine(PhaseAccounting):
             account = self._account(aid)
             if account['mode'] != 'browser':
                 raise ValidationError('仅浏览器账户可以人工核对')
+            if body.get('adopt_position') is not None:
+                if body['adopt_position'] is not True or body.get('terminal_status') is not None:
+                    raise ValidationError('持仓接管选项无效')
+                return self._adopt_verified_position(account,body)
             if body.get('terminal_status') is not None:
                 if body['terminal_status']!='failed':
                     raise ValidationError('仅支持显式确认 failed 终止状态')
@@ -2185,7 +2341,7 @@ class Engine(PhaseAccounting):
                 self._phase_summary(account,d['history'],result['trading_day'])
                 account['daily_entry_used'] = self._daily_entry_used(account['id'],window=result['entry_day'])
                 account['strategy_unlock_at'] = (entry_day_window(account['strategy_locked_at'])['end']
-                    if not execution_excluded(account) and not account.get('retired_failed') and not account.get('archived') and account.get('strategy_locked') and number(account.get('strategy_locked_at')) is not None else None)
+                    if not execution_excluded(account) and not account.get('retired_failed') and not account.get('archived') and account.get('strategy_locked') and account.get('strategy_lock_source')!='live_default' and number(account.get('strategy_locked_at')) is not None else None)
                 if account['mode']=='browser':
                     if account.get('auto_discovered'):
                         execution = d['execution_sessions'].get(account['session_id'],{})

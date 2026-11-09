@@ -1,7 +1,7 @@
 /* Operates only the public webpage DOM; never reads the website's credentials. */
 (() => {
   'use strict';
-  const VERSION = '0.3.18';
+  const VERSION = '0.3.20';
   const CONTROLLER = '__vestControlBridgeController';
   // A previous injection may belong to a reloaded extension context. Retire it
   // instead of trusting a boolean marker that can outlive its message listener.
@@ -27,6 +27,7 @@
   let lastModeHeartbeat = 0;
   let bootReady = false;
   let phaseAdvance = null;
+  let terminalDismissal = null;
   let lastCostObservation = 0;
   let preparationOnly = location.hash.startsWith('#vest-preparation=');
   let preparationGuardInstalled = false;
@@ -82,6 +83,31 @@
     if (tab && isSelected(tab) && panel && visible(panel)) return panel;
     if (required) throw new Error('请保持活动持仓标签选中并等待数据加载');
     return null;
+  }
+  async function ensurePositionPanelLayout(guard = () => {}) {
+    const pane=document.getElementById('trade-account-tabs');
+    const tab=queryOne('[data-testid="account-tab-active-positions"]');
+    if (!pane || !tab || !pane.contains(tab) || pane.getBoundingClientRect().height>=200) return;
+    const identity=observerIdentity().signature;
+    const separator=pane.previousElementSibling;
+    const chart=separator?.previousElementSibling;
+    if (!separator?.matches('[data-slot="resizable-handle"][role="separator"][aria-orientation="horizontal"]') || chart?.id!=='trade-chart-activity') {
+      const error=new Error('持仓面板高度不足，无法定位其展开控件，请展开持仓区域');error.code='OBSERVATION_PENDING';throw error;
+    }
+    // The native virtual table omits its rows when the pane is nearly collapsed.
+    // Resize only the verified chart/account separator, before any order lease.
+    for(let step=0;step<8 && pane.getBoundingClientRect().height<200;step++) {
+      guard();assertNoDialogs();
+      if(observerIdentity().signature!==identity)throw new Error('展开持仓区域时账号或阶段发生变化');
+      separator.focus({preventScroll:true});
+      separator.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowUp',code:'ArrowUp',bubbles:true,cancelable:true}));
+      separator.dispatchEvent(new KeyboardEvent('keyup',{key:'ArrowUp',code:'ArrowUp',bubbles:true,cancelable:true}));
+      await delay(100);
+    }
+    guard();
+    if(pane.getBoundingClientRect().height<200) {
+      const error=new Error('持仓表仍未展开，等待可读取持仓行后再继续');error.code='OBSERVATION_PENDING';throw error;
+    }
   }
   function assertNoDialogs(allowed = null) {
     const dialogs = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].filter(visible);
@@ -150,7 +176,7 @@
       native_tp_price: tpPrice, native_sl_price: slPrice,
       native_sl: slPrice > 0 && (side === 'buy' ? slPrice < entry : slPrice > entry),
       native_tp: tpPrice > 0 && (side === 'buy' ? tpPrice > entry : tpPrice < entry),
-      native_sl_absent: !!protection && !sl,
+      native_sl_absent: !!protection && (!sl || /^(?:-|—|–)$/.test(core.normalized(elementText(sl)))),
       native_tpsl: tpPrice > 0 && slPrice > 0 && (side === 'buy' ? tpPrice > entry && slPrice < entry : tpPrice < entry && slPrice > entry),
     };
   }
@@ -316,6 +342,7 @@
     if (preparationOnly) throw new Error('预备窗口不能启用执行模式');
     assertExecutableAccount();
     guard();
+    await ensurePositionPanelLayout(guard);
     if (config?.autoDiscovered && (!opening || config.accountCategory === 'passed')) {
       // Vest may remove the opening form after evaluation success. A flat
       // completed account only needs observation; do not revoke other accounts.
@@ -335,6 +362,7 @@
     const until = Date.now() + 12000;
     while (Date.now() < until) {
       await delay(350);
+      await ensurePositionPanelLayout(() => assertArmed(job));
       const closeDialog = job.type === 'close' ? queryOne('[data-testid="close-dialog"]') : null;
       assertNoDialogs(closeDialog);
       const current = assertAccount(job.type === 'open');
@@ -500,10 +528,11 @@
 
   // Account observation is independent from the trading adapter. It never prepares
   // order inputs, reads credentials or creates a trade binding.
-  function observerAssertPage() {
+  function observerAssertPage(allowTerminalNotice = false) {
     assertLive();
     if (!core.isNqTradePath(location.pathname)) throw new Error('请打开已登录的 Vest NQ-PERP 交易页面');
-    if ([...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].some(visible)) throw new Error('页面存在弹窗，请先关闭后再读取账户');
+    if ([...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].some(visible) &&
+        !(allowTerminalNotice && (terminalAccountDialog() || liveActivationDialog()))) throw new Error('页面存在弹窗，请先关闭后再读取账户');
   }
   function observerTrigger() {
     return queryOne('[data-testid="account-selector-trigger"]', document, true);
@@ -880,6 +909,7 @@
     return {dialog, button:buttons[0], ready};
   }
   async function advanceCompletedPhase(epoch, receivedJob = null) {
+    if (await advanceCompletedLive(epoch)) return true;
     if (disposed || preparationOnly || executionMode !== 'execute' || executionEpoch !== epoch) return false;
     assertExecution(epoch);
     if (phaseAdvance?.epoch !== epoch) phaseAdvance = null;
@@ -963,6 +993,144 @@
     lastDiagnostic = '同名账户已进入 2/2，阶段账本已同步';
     return true;
   }
+  let liveAdvance=null;
+  function liveActivationDialog() {
+    const dialogs=[...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].filter(visible);
+    if (dialogs.length!==1 || dialogs[0].getAttribute('role')!=='dialog') return null;
+    const dialog=dialogs[0],title=queryOne('[data-slot="dialog-title"]',dialog);
+    if (!title || queryOne('[data-testid="confirm-order-submit"],[data-testid="close-submit"]',dialog)) return null;
+    let description=queryOne('[data-slot="dialog-description"]',dialog);
+    if (!description) {
+      const header=title.closest('[data-slot="dialog-header"]');
+      const siblings=header?[...header.children].filter(el=>visible(el)&&el!==title&&!el.contains(title)):[];
+      if (siblings.length===1) description=siblings[0];
+    }
+    if (!core.liveActivationNotice(elementText(title),elementText(description))) return null;
+    const buttons=[...dialog.querySelectorAll('button')].filter(visible);
+    const go=buttons.filter(el=>/^(?:前往 Funded Account|Go to Funded Account)$/i.test(elementText(el)));
+    if (go.length!==1 || buttons.some(el=>el!==go[0] && !/^(?:我理解|I Understand)$/i.test(elementText(el)))) return null;
+    if (buttons.length>1 && !go[0].disabled) return null;
+    return {dialog,button:go[0]};
+  }
+  async function advanceCompletedLive(epoch) {
+    if (disposed || preparationOnly || executionMode!=='execute' || executionEpoch!==epoch) return false;
+    if (liveAdvance && liveAdvance.epoch!==epoch) liveAdvance=null;
+    const modal=liveActivationDialog();
+    if (!modal && !liveAdvance) return false;
+    assertExecution(epoch);
+    if (!liveAdvance) {
+      const identity=observerIdentity(),matches=sessionAccounts.filter(a=>a.name===identity.name);
+      if (identity.phase!=='2/2' || identity.category!=='passed' || matches.length!==1 || matches[0].phase!=='2/2' ||
+          observedAccounts.filter(a=>a.name===identity.name).length!==1) throw new Error('评估通过弹窗与已登记二阶段账号不符');
+      core.assertExecutionAllowed(matches[0]);
+      if (modal.button.disabled || modal.button.getAttribute('aria-disabled')==='true' || modal.button.getAttribute('aria-busy')==='true') {
+        lastDiagnostic='评估已通过，等待平台允许激活 Live；未点击禁用或加载中的按钮';return true;
+      }
+      assertNoDialogs(modal.dialog);
+      const reserved=await call('live-activation-reserve',{account_id:matches[0].id,name:identity.name,mode_epoch:epoch});
+      assertExecution(epoch);
+      if (reserved.duplicate || reserved.status!=='pending') throw new Error('该账号已有 Live 激活尝试，请核对结果；未重复点击');
+      const fresh=liveActivationDialog(),current=observerIdentity();
+      if (!fresh || current.name!==identity.name || current.phase!=='2/2' || current.category!=='passed' ||
+          fresh.button.disabled || fresh.button.getAttribute('aria-disabled')==='true' || fresh.button.getAttribute('aria-busy')==='true') throw new Error('激活前账号或按钮状态变化，未点击');
+      assertNoDialogs(fresh.dialog);assertExecution(epoch);
+      liveAdvance={epoch,name:identity.name,accountId:matches[0].id,clickedAt:reserved.started_at,returnClicked:false};
+      click(fresh.button);
+      lastDiagnostic='已点击前往 Funded Account，等待同名 Live 账号；不会重复激活';return true;
+    }
+    const pending=liveAdvance;
+    if (pending.epoch!==epoch) throw new Error('Live 激活授权已变化，请核对结果');
+    if (Date.now()-pending.clickedAt>20000) throw new Error('Live 激活后 20 秒内未完成核验；未重复点击，请核对页面');
+    if (modal) return true;
+    assertNoDialogs();
+    let identity;
+    try {identity=observerIdentity();} catch {return true;}
+    if (identity.name!==pending.name) throw new Error('Live 激活后账号名称变化，请核对关联账号');
+    if (location.pathname==='/portfolio') {
+      if (identity.phase!=='live') return true;
+      if (!pending.returnClicked) {
+        const links=[...document.querySelectorAll('a[href]')].filter(el=>visible(el)&&/^(?:交易|Trade)$/i.test(elementText(el))&&
+          el.origin===location.origin && ['/trade','/trade/NQ-PERP','/trade/NDX-USD-PERP'].includes(el.pathname));
+        if (links.length!==1) {lastDiagnostic='Live 已激活，等待唯一交易导航出现';return true;}
+        assertExecution(epoch);pending.returnClicked=true;click(links[0]);
+      }
+      return true;
+    }
+    if (!core.isNqTradePath(location.pathname)) {
+      if (location.pathname==='/trade') return true;
+      throw new Error('Live 激活后未返回 NQ 交易页，请核对页面');
+    }
+    if (identity.phase!=='live') return true;
+    const values=await observerWaitStable(pending.name,300),proof=values.phase_snapshot;
+    assertExecution(epoch);
+    if (values.phase!=='live' || proof?.phase!=='live' || proof.position_open!==false || proof.unrealized_pnl!==0 || !(proof.price>0)) throw new Error('Live 账号缺少新鲜明确空仓读数');
+    const cached=observedAccounts.filter(a=>a.name===pending.name);
+    if (cached.length!==1) throw new Error('Live 同名账号无法唯一对应');
+    applyObservedPhase(cached[0],'live');
+    for (const item of observedAccounts) item.current=item.name===pending.name;
+    Object.assign(cached[0],values,{current:true});
+    const reply=await observerPublish();acceptSession(reply);assertExecution(epoch);
+    const saved=reply?.accounts?.find(a=>a.id===pending.accountId && a.name===pending.name);
+    if (saved?.phase!=='live' || saved.phase_pending) return true;
+    await call('live-activation-complete',{account_id:pending.accountId,name:pending.name,mode_epoch:epoch});
+    assertExecution(epoch);
+    if (config?.accountId===pending.accountId) config.armed=false;
+    liveAdvance=null;
+    lastDiagnostic=saved.strategy_locked?'已进入 Live 并默认锁定，继续其他账号':'Live 阶段已核验，按独立参数继续策略';
+    return true;
+  }
+  function terminalAccountDialog() {
+    const dialogs=[...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].filter(visible);
+    if (dialogs.length!==1 || dialogs[0].getAttribute('role')!=='dialog') return null;
+    const dialog=dialogs[0];
+    if (dialog.matches('[data-testid="close-dialog"]') || queryOne('[data-testid="confirm-order-submit"]',dialog)) return null;
+    const title=queryOne('[data-slot="dialog-title"]',dialog);
+    let description=queryOne('[data-slot="dialog-description"]',dialog);
+    if (!description && title) {
+      // Vest's capital-result header uses a plain sibling div, not the shared
+      // DialogDescription component (verified against the current public build).
+      const header=title.closest('[data-slot="dialog-header"]');
+      const siblings=header ? [...header.children].filter(el=>visible(el) && el!==title && !el.contains(title)) : [];
+      if (siblings.length===1) description=siblings[0];
+    }
+    const reason=core.terminalNoticeReason(elementText(title),elementText(description));
+    if (!reason) return null;
+    const identity=observerIdentity();
+    if (!['failed','closed'].includes(identity.category) || core.executionExcluded(identity)) return null;
+    const close=[...dialog.querySelectorAll('button')].filter(button=>visible(button) &&
+      /^(?:Close|关闭|關閉)$/i.test(core.normalized(button.getAttribute('aria-label') || button.textContent)) &&
+      !button.matches('[data-testid="close-submit"],[data-testid="confirm-order-submit"],[data-testid^="position-close-"]'));
+    if (close.length!==1) return null;
+    return {dialog,button:close[0],identity,reason};
+  }
+  async function handleCurrentTerminal(epoch) {
+    const identity=observerIdentity();
+    if (!['failed','closed'].includes(identity.category) || core.executionExcluded(identity)) return false;
+    const modal=terminalAccountDialog();
+    const saved=sessionAccounts.filter(item=>item.name===identity.name);
+    const acknowledged=saved.length===1 && saved[0].retired_failed;
+    if (!acknowledged) {
+      assertExecution(epoch);
+      if (!await reportCurrentTerminal(identity.name)) return true;
+      assertExecution(epoch);
+    }
+    if (!modal) { terminalDismissal=null; return !acknowledged; }
+    assertExecution(epoch);
+    const fresh=terminalAccountDialog();
+    if (!fresh || fresh.dialog!==modal.dialog || fresh.identity.signature!==identity.signature) return true;
+    if (terminalDismissal?.epoch===epoch && terminalDismissal.name===identity.name && terminalDismissal.dialog===fresh.dialog) {
+      lastDiagnostic=identity.name+' 关闭提示尚未消失，等待读取；不重复点击';
+      return true;
+    }
+    assertNoDialogs(fresh.dialog);
+    if (fresh.button.disabled || fresh.button.getAttribute('aria-disabled')==='true' || fresh.button.getAttribute('aria-busy')==='true') return true;
+    // Archive acknowledgement precedes this informational Close. Paid retry,
+    // account purchases, order confirmations and historical links are untouched.
+    terminalDismissal={epoch,dialog:fresh.dialog,name:identity.name};
+    click(fresh.button);
+    lastDiagnostic=identity.name+' 已确认关闭并归档，已关闭亏损上限提示，等待切换下一账户';
+    return true;
+  }
   async function reportCurrentTerminal(expectedName) {
     // Read only the named current-account badge. A missing account, hidden
     // money or an unrelated card/dialog is never proof of evaluation failure.
@@ -1041,6 +1209,7 @@
     let receivedJob = null;
     let account = null;
     try {
+      if (await handleCurrentTerminal(epoch)) return;
       if (await advanceCompletedPhase(epoch)) return;
       const routed = await call('execution-next');
       acceptSession(routed);
@@ -1097,6 +1266,7 @@
       try {
         assertExecution(epoch);
         const observed = await execute(receivedJob);
+        if (await reportCurrentTerminal(account.name)) return;
         await call('result', { account_id: account.id, session_id: executionSession, mode_epoch: epoch,
           result: { job_id: receivedJob.id, success: true, confirmed: true, snapshot: observed } });
       } catch (error) {
@@ -1240,7 +1410,7 @@
         const currentName = observerIdentity().name;
         const matches = observedAccounts.filter(item => item.name === currentName);
         if (matches.length !== 1) throw new Error('请先读取账户，且当前账户名称必须唯一');
-        observerAssertPage();
+        observerAssertPage(true);
         if (!Number.isInteger(message.mode_epoch) || message.mode_epoch < executionEpoch || !message.session_id) throw new Error('执行授权已过期');
         preparingEpoch = message.mode_epoch; executionEpoch = Math.max(executionEpoch, message.mode_epoch); executionSession = message.session_id;
         // Mode preflight confirms connection and identity only. The current

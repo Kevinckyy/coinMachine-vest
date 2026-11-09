@@ -40,6 +40,18 @@ export async function runStrategyChecks({base,root,run,command,evaluate,clickTex
   assert.ok(await evaluate(`document.querySelector('.strategy-summary').textContent.includes('Live 优先')`));
   assert.equal(await value('剩余最大回撤阈值'),'200');
   assert.equal(await evaluate('document.querySelector(\'.strategy-stop-toggle input\').checked'),false);
+  assert.equal(await value('Live 止损金额'),'130');
+  assert.equal(await value('Live 止盈金额'),'');
+  assert.equal(await page(()=>document.querySelector('[aria-label="Live 号默认锁定"]').checked),true);
+  await edit({'Live 止盈金额':151.5,'Live 止损金额':61.5});
+  await page(()=>{
+    document.querySelector('[aria-label="Live 号默认锁定"]').click();
+    document.querySelector('[aria-label="Live 剩余最大回撤不足时不设置止损"]').click();
+    document.querySelector('[aria-label="Live 仓位大小 50%"]').click();
+    const el=document.querySelector('[aria-label="Live 下单方向"]');
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(el,'buy');el.dispatchEvent(new Event('change',{bubbles:true}));
+  });
+  await edit({'Live 剩余最大回撤阈值':91.5});
   await edit({'每批账户数量':4,'策略止损金额':177.5,'账户下单最大延迟秒':21,'账户下单最小延迟秒':9,'批次最大间隔秒':71,'批次最小间隔秒':31});
   await page(()=>{
     document.querySelector('[aria-label='+CSS.escape('仓位大小 75%')+']').click();
@@ -51,7 +63,9 @@ export async function runStrategyChecks({base,root,run,command,evaluate,clickTex
   await until(()=>evaluate('document.querySelector(\'.strategy-stop-rule input[type=number]\').disabled===false'),'threshold enabled');
   await edit({'剩余最大回撤阈值':222.5});
   const expected={batch_size:4,stop_loss:177.5,size_percent:75,side:'sell',order_delay_min:9,order_delay_max:21,
-    batch_delay_min:31,batch_delay_max:71,skip_stop_loss_on_low_drawdown:true,drawdown_stop_loss_threshold:222.5};
+    batch_delay_min:31,batch_delay_max:71,skip_stop_loss_on_low_drawdown:true,drawdown_stop_loss_threshold:222.5,
+    live_default_locked:false,live_take_profit:151.5,live_stop_loss:61.5,live_size_percent:50,live_side:'buy',
+    live_skip_stop_loss_on_low_drawdown:true,live_drawdown_stop_loss_threshold:91.5};
   await until(async()=>{const p=await profile();return Object.entries(expected).every(([key,val])=>p[key]===val);},'durable parameter save');
   assert.equal((await (await fetch(base+'/api/state')).json()).strategy.status,'idle');
   await visit();
@@ -79,12 +93,16 @@ export async function runStrategyChecks({base,root,run,command,evaluate,clickTex
   await visit();
   assert.equal(await value('策略止损金额'),'180');
   assert.equal(await value('剩余最大回撤阈值'),'223');
+  assert.equal(await value('Live 止盈金额'),'151.5');assert.equal(await value('Live 止损金额'),'61.5');
+  assert.equal(await value('Live 剩余最大回撤阈值'),'91.5');
+  assert.equal(await page(()=>document.querySelector('[aria-label="Live 号默认锁定"]').checked),false);
+  assert.equal(await value('Live 下单方向'),'buy');
   assert.equal((await (await fetch(base+'/api/state')).json()).strategy.status,'idle');
   const screenshot=await command('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});
   const screenshotPath=path.join(run,'strategy-settings.png');
   await writeFile(screenshotPath,Buffer.from(screenshot.data,'base64'));
   const settings={ok:true,checks:['unstarted form auto-save','all execution parameters and stop-rule values','refresh restores values',
-    'latest rapid edit wins','polling preserves edits','invalid settings preserve saved values','service restart restores values without starting strategy','old server cannot silently ignore the new rule'],screenshot:screenshotPath};
+    'latest rapid edit wins','polling preserves edits','invalid settings preserve saved values','service restart restores values without starting strategy','old server cannot silently ignore the new rule','independent Live exits/direction/sizing/threshold and default lock survive refresh and restart'],screenshot:screenshotPath};
   await command('Page.navigate',{url:base+'/api/health'});
   await until(()=>evaluate('document.readyState===\'complete\' && location.pathname===\'/api/health\''),'stop-rule fixture page');
   const fixture=await readFile(path.join(root,'tests','bridge-fixture.html'),'utf8');

@@ -99,7 +99,57 @@ try {
     assert.equal(outcome.ok,true,JSON.stringify(outcome));
     return outcome;
   };
-  if(process.env.VEST_SMOKE_BACKTEST_ONLY==='1'){
+  const runLiveDialogFixture=async()=>{
+    await command('Page.navigate',{url:base+'/api/health'});
+    await until(()=>evaluate(`document.readyState==='complete' && location.pathname==='/api/health'`),'live dialog fixture page');
+    const fixture=await readFile(path.join(root,'tests','live-dialog-fixture.html'),'utf8');
+    await evaluate(`document.open();document.write(${JSON.stringify(fixture.replace(/<script>[\s\S]*?<\/script>/,''))});document.close();`);
+    await evaluate(fixture.match(/<script>([\s\S]*?)<\/script>/)[1]);
+    await evaluate(await readFile(path.join(root,'extension','core.js'),'utf8'));
+    await evaluate(await readFile(path.join(root,'extension','content.js'),'utf8'));
+    const outcome=await evaluate('runLiveDialogFixtureTests()',60000);
+    assert.equal(outcome.ok,true,JSON.stringify(outcome));
+    return outcome;
+  };
+  const runFailureFixture=async()=>{
+  const failureContinuation=[];
+  for(const options of [{label:'Closed'},{label:'已关闭',missingCache:true},{label:'Closed',missingCache:true,idle:true},{live:true},{live:true,pnlLabel:'Unrealized PnL',bannerOnly:true},{pendingOpening:true},
+    {label:'已关闭',dialog:'daily_loss',missingPanel:true},{dialog:'daily_loss',alreadyRetired:true,missingPanel:true},
+    {dialog:'drawdown'},{dialog:'english'},{dialog:'daily_loss',stickyDialog:true},
+    {live:true,dialog:'daily_loss',missingPanel:true},{dialog:'daily_loss',unknownDialog:true},
+    {dialog:'daily_loss',extraDialog:true},{dialog:'daily_loss',revokeDuringArchive:true},
+    {collapsedPane:true},{collapsedPane:true,invalidSeparator:true}]) {
+    await command('Page.navigate', { url: base + '/api/health' });
+  await until(() => evaluate(`document.readyState === 'complete' && location.pathname === '/api/health'`), 'failure continuation fixture page');
+  const failureFixture=await readFile(path.join(root,'tests','failed-account-fixture.html'),'utf8');
+  const failureScript=failureFixture.match(/<script>([\s\S]*?)<\/script>/)[1];
+  await evaluate(`document.open(); document.write(${JSON.stringify(failureFixture.replace(/<script>[\s\S]*?<\/script>/,''))}); document.close();`);
+  await evaluate(`globalThis.failureFixtureOptions=${JSON.stringify(options)}`);
+  await evaluate(failureScript);
+  await evaluate(await readFile(path.join(root,'extension','core.js'),'utf8'));
+  await evaluate(await readFile(path.join(root,'extension','content.js'),'utf8'));
+  const outcome=await evaluate('runFailedAccountFixtureTests()',15000);
+  assert.equal(outcome.ok,true,JSON.stringify({options,...outcome}));
+  failureContinuation.push({options,...outcome});
+  }
+    return failureContinuation;
+  };
+  if(process.env.VEST_SMOKE_LIVE_ONLY==='1'){
+    console.log(JSON.stringify(await runLiveDialogFixture()));
+  } else if(process.env.VEST_SMOKE_STOP_RULE_ONLY==='1'){
+    await command('Page.navigate',{url:base+'/api/health'});
+    await until(()=>evaluate(`document.readyState==='complete' && location.pathname==='/api/health'`),'native protection fixture');
+    const fixture=await readFile(path.join(root,'tests/bridge-fixture.html'),'utf8');
+    await evaluate(`document.open(); document.write(${JSON.stringify(fixture.replace(/<script>[\s\S]*?<\/script>/,''))}); document.close();`);
+    await evaluate(fixture.match(/<script>([\s\S]*?)<\/script>/)[1]);
+    await evaluate(await readFile(path.join(root,'extension/core.js'),'utf8'));
+    await evaluate(await readFile(path.join(root,'extension/content.js'),'utf8'));
+    const stopRule=await evaluate('runStopRuleFixtureTests()',60000);
+    assert.equal(stopRule.failed,0,JSON.stringify(stopRule));
+    console.log(JSON.stringify({ok:true,stopRule},null,2));
+  } else if(process.env.VEST_SMOKE_FAILURE_ONLY==='1'){
+    console.log(JSON.stringify({ok:true,failureContinuation:await runFailureFixture()},null,2));
+  } else if(process.env.VEST_SMOKE_BACKTEST_ONLY==='1'){
     const {runBacktestChecks}=await import('../tests/backtest-browser-checks.mjs');
     console.log(JSON.stringify(await runBacktestChecks({base,root,run,command,evaluate,clickText,until,sleep,errors}),null,2));
   } else if(process.env.VEST_SMOKE_STRATEGY_ONLY==='1'){
@@ -390,21 +440,7 @@ try {
   const phaseTransition=await runPhaseFixture();
   const phaseExecution=await runPhaseExecutionFixture();
   const phaseDialog=await runPhaseDialogFixture();
-  const failureContinuation=[];
-  for(const options of [{label:'Closed'},{label:'已关闭',missingCache:true},{label:'Closed',missingCache:true,idle:true},{live:true},{live:true,pnlLabel:'Unrealized PnL',bannerOnly:true},{pendingOpening:true}]) {
-    await command('Page.navigate', { url: base + '/api/health' });
-  await until(() => evaluate(`document.readyState === 'complete' && location.pathname === '/api/health'`), 'failure continuation fixture page');
-  const failureFixture=await readFile(path.join(root,'tests','failed-account-fixture.html'),'utf8');
-  const failureScript=failureFixture.match(/<script>([\s\S]*?)<\/script>/)[1];
-  await evaluate(`document.open(); document.write(${JSON.stringify(failureFixture.replace(/<script>[\s\S]*?<\/script>/,''))}); document.close();`);
-  await evaluate(`globalThis.failureFixtureOptions=${JSON.stringify(options)}`);
-  await evaluate(failureScript);
-  await evaluate(await readFile(path.join(root,'extension','core.js'),'utf8'));
-  await evaluate(await readFile(path.join(root,'extension','content.js'),'utf8'));
-  const outcome=await evaluate('runFailedAccountFixtureTests()',15000);
-  assert.equal(outcome.ok,true,JSON.stringify({options,...outcome}));
-  failureContinuation.push({options,...outcome});
-  }
+  const failureContinuation=await runFailureFixture();
   console.log(JSON.stringify({ ok: true, checks: ['dashboard', 'candlestick chart', 'bounded chart layout', '5 pages', 'account creation', 'bulk paper order', 'persisted history', 'automatically discovered accounts without trade binding', 'read-only mode prevents execution', 'plugin execute mode enables orders and strategy pool', 'switching back to read-only revokes execution', 'unknown financial values remain unknown', 'responsive viewport', 'no runtime errors'], bridge, stopRule, accountObservation, phaseTransition, phaseExecution, phaseDialog, failureContinuation, screenshots: [path.join(run, 'dashboard.png'), path.join(run, 'browser-accounts.png'), path.join(run, 'mobile.png')] }, null, 2));
   }
 } finally {

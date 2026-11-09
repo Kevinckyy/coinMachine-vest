@@ -1,0 +1,96 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Isolated evaluation passed to Live</title></head><body>
+<button data-testid="account-selector-trigger"><span class="truncate">Same Name</span><span id="category">已通过</span></button>
+<p data-testid="account-value">$5,250.21</p><p data-testid="account-upnl">$253.00</p><p data-testid="book-mark">$100.00</p>
+<div class="sticky top-14"><span id="phase" data-slot="badge">第 2/2 阶段</span></div>
+<div data-testid="order-form"><button data-testid="ordertype-tab-market" aria-selected="true">Market</button><input data-testid="size-input" value="1"><button data-testid="size-unit-select" data-unit="micro">Micro</button><button data-testid="tpsl-unit-usd" aria-selected="true">USD</button><input data-testid="tpsl-input-tp"><input data-testid="tpsl-input-sl"><button data-testid="submit-long">Buy</button><button data-testid="submit-short">Sell</button></div>
+<button data-testid="account-tab-active-positions" aria-selected="true" aria-controls="positions">Active Positions</button><div id="positions"><p>No positions yet</p></div>
+<script>
+(() => {
+ const account={id:'live-source',name:'Same Name',phase:'2/2',category:'eval',identity:'eval:Same Name',auto_discovered:true,current:true,balance:5000,equity:5253,unrealized_pnl:253,observed_at:Date.now()/1000};
+ const state={handler:null,timer:null,mode:'readonly',epoch:0,clicks:0,returns:0,messages:[],attempts:{},offset:0,locked:true,locale:'zh',revoke:false};
+ const originalNow=Date.now.bind(Date);Date.now=()=>originalNow()+state.offset;
+ const clone=x=>structuredClone(x),assert=(v,m)=>{if(!v)throw new Error(m);};
+ const send=m=>new Promise(resolve=>state.handler(m,{},resolve));
+ const response=extra=>({ok:true,data:{mode:state.mode,mode_epoch:state.epoch,accounts:[clone(account)],...extra}});
+ const forbidden=()=>{throw new Error('A trading button was clicked');};
+ document.querySelector('[data-testid="submit-long"]').onclick=forbidden;document.querySelector('[data-testid="submit-short"]').onclick=forbidden;
+ globalThis.setInterval=callback=>{state.timer=callback;return 1;};
+ async function mode(value){state.mode=value;const r=await send({type:'control-mode',mode:value,mode_epoch:++state.epoch,session_id:'live-dialog-session',accounts:[clone(account)]});assert(r.ok,'Mode failed');}
+ Object.defineProperty(globalThis,'chrome',{configurable:true,value:{runtime:{id:'live-fixture',onMessage:{addListener:h=>{state.handler=h;}},sendMessage:async m=>{
+  state.messages.push(clone(m));
+  if(m.type==='observation-restore')return response({enabled:true});
+  if(m.type==='mode-heartbeat')return response({});
+  if(m.type==='execution-next')return response({next_account:null});
+  if(m.type==='live-activation-reserve'){
+   assert(m.account_id===account.id&&m.name===account.name&&m.mode_epoch===state.epoch,'Wrong activation identity');
+   if(state.attempts[m.account_id])return response({...state.attempts[m.account_id],duplicate:true});
+   const attempt={started_at:Date.now(),status:'pending'};state.attempts[m.account_id]=attempt;
+   if(state.revoke)await mode('readonly');
+   return response(attempt);
+  }
+  if(m.type==='observe'){
+   const row=m.accounts.find(a=>a.name===account.name);
+   if(row?.phase==='live'){
+    assert(row.phase_snapshot?.phase==='live'&&row.phase_snapshot.position_open===false&&row.phase_snapshot.unrealized_pnl===0,'Missing Live flat proof');
+    Object.assign(account,clone(row),{strategy_locked:state.locked});
+   }
+   return response({});
+  }
+  if(m.type==='live-activation-complete'){assert(account.phase==='live','Completed before Live proof');return response({completed:true});}
+  if(m.type==='execution-failed'){state.mode='readonly';return response({});}
+  if(['result','size','poll'].includes(m.type))throw new Error('Activation fabricated or dispatched a trade: '+m.type);
+  throw new Error('Unexpected '+m.type);
+ }},storage:{local:{get:async()=>({}),set:async()=>{}},onChanged:{addListener:()=>{}}}}});
+ function show(){
+  document.querySelector('[role="dialog"]')?.remove();const d=document.createElement('div');d.setAttribute('role','dialog');
+  d.innerHTML=state.locale==='zh'?'<div data-slot="dialog-header"><h2 data-slot="dialog-title">评估通过</h2><div>恭喜 - 您已通过评估阶段。<br>您的 <span>$5,000</span> Funded Account 现已转为实盘。</div></div><table><tr><td>NQ</td><td>+$253.00</td></tr></table><button id="activate">前往 Funded Account</button>':
+   '<div data-slot="dialog-header"><h2 data-slot="dialog-title">Evaluation Passed</h2><div>Congratulations - you\'ve passed the Evaluation Phase.<br>Your <span>$5,000</span> Funded Account is now live.</div></div><button id="activate">Go to Funded Account</button>';
+  document.body.append(d);document.getElementById('activate').onclick=()=>{state.clicks++;};
+ }
+ function activated(){
+  document.querySelector('[role="dialog"]')?.remove();document.getElementById('phase').textContent='Live';document.getElementById('category').textContent='Funded Account';
+  document.querySelector('[data-testid="account-value"]').textContent='$5,000.00';document.querySelector('[data-testid="account-upnl"]').textContent='$0.00';
+  history.pushState(null,'','/portfolio');
+  const link=document.createElement('a');link.id='return-trade';link.href='/trade';link.textContent='交易';link.onclick=e=>{e.preventDefault();state.returns++;history.pushState(null,'','/trade/NQ-PERP');};document.body.append(link);
+ }
+ async function setup(locale='zh'){
+  document.querySelectorAll('[role="dialog"],[role="alertdialog"],#return-trade,[data-testid="confirm-order-submit"]').forEach(e=>e.remove());
+  Object.assign(state,{clicks:0,returns:0,messages:[],attempts:{},offset:0,locked:true,locale,revoke:false});
+  Object.assign(account,{phase:'2/2',category:'eval',identity:'eval:Same Name',balance:5000,equity:5253,unrealized_pnl:253,strategy_locked:false});
+  document.querySelector('[data-testid="account-selector-trigger"] .truncate').textContent=account.name;document.getElementById('category').textContent='已通过';document.getElementById('phase').textContent='第 2/2 阶段';
+  document.querySelector('[data-testid="account-value"]').textContent='$5,250.21';document.querySelector('[data-testid="account-upnl"]').textContent='$253.00';
+  history.replaceState(null,'','/trade/NQ-PERP');await mode('execute');show();
+ }
+ globalThis.runLiveDialogFixtureTests=async()=>{
+  await new Promise(r=>setTimeout(r,20));const checks=[];
+  for(const locale of ['zh','en'])for(const locked of [true,false]){
+   await setup(locale);state.locked=locked;await state.timer();await state.timer();assert(state.clicks===1,'Activation not exactly once');
+   assert(!state.messages.some(m=>m.type==='poll'),'Stale $253 top value became a trade receipt');
+   activated();await state.timer();assert(state.returns===1,'Did not use native Trade navigation');await state.timer();
+   assert(account.phase==='live'&&account.strategy_locked===locked,'Live stage/default lock not synchronized');
+   assert(state.messages.some(m=>m.type==='live-activation-complete'),'Activation not completed');
+   assert(!state.messages.some(m=>['execution-failed','result','size','poll'].includes(m.type)),'Activation revoked or traded');
+   checks.push(locale+': one activation, portfolio return, fresh Live proof, lock='+locked);
+  }
+  for(const [label,mutate] of [
+   ['wrong title',()=>document.querySelector('[data-slot="dialog-title"]').textContent='付款完成'],
+   ['wrong description',()=>document.querySelector('[data-slot="dialog-header"]>div').textContent='请购买新的资金账户'],
+   ['extra dialog',()=>{const d=document.createElement('div');d.setAttribute('role','alertdialog');d.textContent='Risk';document.body.append(d);}],
+   ['wrong current phase',()=>document.getElementById('phase').textContent='第 1/2 阶段'],
+   ['wrong account',()=>document.querySelector('[data-testid="account-selector-trigger"] .truncate').textContent='Other'],
+   ['not passed',()=>document.getElementById('category').textContent='Evaluation'],
+   ['order confirmation',()=>{const b=document.createElement('button');b.dataset.testid='confirm-order-submit';document.querySelector('[role="dialog"]').append(b);}],
+  ]){await setup();mutate();await state.timer();assert(state.clicks===0,label+' clicked');checks.push(label+' never activates');}
+  await setup();await mode('readonly');await state.timer();assert(state.clicks===0,'Readonly activated');checks.push('readonly never activates');
+  await setup();document.getElementById('activate').disabled=true;await state.timer();assert(state.clicks===0&&!state.messages.some(m=>m.type==='execution-failed'),'Limit disabled button mishandled');checks.push('platform Live limit waits without clicks');
+  await setup();document.getElementById('activate').disabled=true;const understand=document.createElement('button');understand.textContent='我理解';understand.onclick=forbidden;document.querySelector('[role="dialog"]').append(understand);await state.timer();assert(state.clicks===0&&!state.messages.some(m=>m.type==='execution-failed'),'Limit acknowledgement clicked');checks.push('platform limit acknowledgement is not mistaken for activation');
+  await setup();document.getElementById('activate').setAttribute('aria-busy','true');await state.timer();assert(state.clicks===0,'Loading activation clicked');checks.push('loading activation waits');
+  await setup();await mode('readonly');const prepared=await send({type:'prepare-execution',mode_epoch:state.epoch+1,session_id:'live-dialog-session',accounts:[clone(account)]});assert(prepared.ok&&state.clicks===0,'Readonly preflight dismissed or rejected known Live notice');await mode('readonly');checks.push('readonly preflight recognizes the notice without clicking');
+  await setup();state.revoke=true;await state.timer();assert(state.clicks===0,'Revocation during reservation clicked');checks.push('revocation during reservation prevents click');
+  await setup();state.attempts[account.id]={started_at:Date.now()-1000,status:'pending'};await state.timer();assert(state.clicks===0,'Persisted reservation replayed');checks.push('persisted activation is never replayed');
+  await setup();await state.timer();state.offset=21000;await state.timer();assert(state.clicks===1&&state.messages.some(m=>m.type==='execution-failed'),'Timeout repeated or did not stop');checks.push('unverified activation stops once without retry');
+  await setup();await state.timer();activated();document.querySelector('[data-testid="account-upnl"]').textContent='$1.00';await state.timer();await state.timer();assert(!state.messages.some(m=>m.type==='live-activation-complete'),'Open or unsettled Live treated as flat');checks.push('nonzero Live PnL cannot be confirmed as flat');
+  return {ok:true,checks};
+ };
+})();
+</script></body></html>

@@ -5,6 +5,7 @@ const contentConnections = new Map();
 const scanStarts = new Map();
 const controlChanges = new Map();
 const modeWrites = new Map();
+const activationWrites = new Map();
 const volatileModes = {};
 const PREPARATION_HASH = '#vest-preparation=';
 const modeStorage = chrome.storage.session || {
@@ -27,6 +28,12 @@ function extensionPage(sender) {
 }
 
 function uuid() { return globalThis.crypto?.randomUUID?.() || Date.now().toString(36) + Math.random().toString(36).slice(2); }
+
+async function serializeActivation(key, action) {
+  const next=(activationWrites.get(key)||Promise.resolve()).catch(()=>{}).then(action);
+  activationWrites.set(key,next);
+  try {return await next;} finally {if(activationWrites.get(key)===next)activationWrites.delete(key);}
+}
 
 async function observationConfig(tabId) {
   const key = 'observation:' + tabId;
@@ -101,7 +108,7 @@ async function saveExecutionError(tabId, error, epoch) {
 
 async function sessionRequest(tabId, options = {}) {
   const observation = await observationConfig(tabId);
-  const state = await controlState(tabId);
+  const state = options.control_state ? { ...options.control_state } : await controlState(tabId);
   if (!observation.token) throw new Error('请先填写本地配对码并读取账户');
   const tab = await targetTab(tabId);
   const result = await localRequest('/api/bridge/session', {
@@ -109,6 +116,7 @@ async function sessionRequest(tabId, options = {}) {
     tab_url: tab.url, accounts: observation.accounts || [],
     ...(options.current_account ? { current_account: options.current_account } : {}),
     heartbeat_only: !!options.heartbeat_only,
+    ...(state.revocation_source ? { revocation_source: state.revocation_source } : {}),
     ...(options.execution_error ? {execution_error:String(options.execution_error).slice(0,500)} : {}),
     ...(options.authorize === true ? { authorize: true, mode: 'execute' } : {}),
   }, observation.token);
@@ -295,6 +303,18 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       return await changeControlMode(message.tabId, message.mode, message.token);
     }
     if (message.type === 'execution-next' || message.type === 'mode-heartbeat') {
+      if (message.type==='mode-heartbeat' && sender.tab && sender.url==='https://next.vestmarkets.com/portfolio') {
+        const control=await controlState(sender.tab.id);
+        const pending=(await chrome.storage.local.get('live-activation-tab:'+sender.tab.id))['live-activation-tab:'+sender.tab.id];
+        if (control.mode==='execute' && pending?.session_id===control.session_id && pending.mode_epoch===control.mode_epoch &&
+            pending.status==='pending' && Date.now()-pending.started_at>=0 && Date.now()-pending.started_at<20000) {
+          // The platform temporarily routes an activation to Portfolio. No trade
+          // API or fictitious NQ heartbeat is sent from that page; the actor has
+          // less than the existing lease duration to return through the UI.
+          return {...control,accounts:[],next_account:null,phase_activation_pending:true};
+        }
+        throw new Error('Live 激活衔接已过期，请返回 NQ 页面核对');
+      }
       if (!sender.tab || !vestTab(sender.url)) throw new Error('执行调度仅接受 Vest 页面');
       const state = await controlState(sender.tab.id);
       if (state.mode !== 'execute') return { ...state, accounts: [], next_account: null };
@@ -310,6 +330,30 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
         }
         throw error;
       }
+    }
+    if (message.type==='live-activation-reserve' || message.type==='live-activation-complete') {
+      if (!sender.tab || !vestTab(sender.url)) throw new Error('Live 激活仅接受已连接的 NQ 页面');
+      const control=await controlState(sender.tab.id),observation=await observationConfig(sender.tab.id);
+      if (control.mode!=='execute' || control.mode_epoch!==message.mode_epoch) throw new Error('Live 激活执行许可已变化');
+      const matches=(observation.registrations||[]).filter(a=>a.id===message.account_id && a.name===message.name && !a.execution_excluded);
+      if (matches.length!==1) throw new Error('Live 激活账号无法唯一对应');
+      const account=matches[0],key='live-activation:'+control.session_id+':'+account.id,tabKey='live-activation-tab:'+sender.tab.id;
+      return await serializeActivation(key,async()=>{
+      const latest=await controlState(sender.tab.id);
+      if(latest.mode!=='execute'||latest.mode_epoch!==control.mode_epoch)throw new Error('Live 激活执行许可已变化');
+      const saved=(await chrome.storage.local.get(key))[key];
+      if (message.type==='live-activation-complete') {
+        if (!saved || saved.status!=='pending' || account.phase!=='live' || account.phase_pending) throw new Error('Live 阶段尚未被服务确认');
+        await chrome.storage.local.set({[key]:{...saved,status:'completed',completed_at:Date.now()},[tabKey]:null});
+        return {completed:true};
+      }
+      if (account.phase!=='2/2') throw new Error('只有已登记二阶段账号可进入 Live');
+      if (saved) return {...saved,duplicate:true};
+      const pending={session_id:control.session_id,mode_epoch:control.mode_epoch,account_id:account.id,name:account.name,
+        started_at:Date.now(),status:'pending',tab_id:sender.tab.id};
+      await chrome.storage.local.set({[key]:pending,[tabKey]:pending});
+      return pending;
+      });
     }
     if (message.type === 'execution-failed') {
       if (!sender.tab || !vestTab(sender.url)) throw new Error('执行状态来源无效');
@@ -390,10 +434,13 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       if (message.type === 'observation-restore') {
         // A new page actor never inherits execution permission from the old page.
         const previous = await controlState(sender.tab.id);
-        const readonly = { ...previous, mode: 'readonly', mode_epoch: previous.mode_epoch + 1 };
+        const readonly = { ...previous, mode: 'readonly', mode_epoch: previous.mode_epoch + 1, revocation_source:'page-actor-restore' };
         await saveControl(sender.tab.id, readonly);
         await closePreparation(sender.tab.id);
-        void sessionRequest(sender.tab.id, { heartbeat_only: true }).catch(() => {});
+        // Capture the revocation's epoch now. If this asynchronous request reads
+        // a later preflight epoch, its late readonly heartbeat can revoke a newly
+        // granted execute lease at that SAME epoch.
+        void sessionRequest(sender.tab.id, { heartbeat_only: true, control_state:readonly }).catch(() => {});
         return { enabled: !!observation?.enabled, accounts: observation?.accounts || [], ...readonly };
       }
       if ((!observation?.enabled && !message.progress?.done) || !observation?.token) throw new Error('只读连接未配对或已停止');

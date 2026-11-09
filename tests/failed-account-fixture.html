@@ -12,10 +12,33 @@
   if(options.pnlLabel)document.getElementById('banner-pnl-label').textContent=options.pnlLabel+':';
   const nativeInterval=globalThis.setInterval.bind(globalThis);
   const state={handler:null,timer:null,messages:[],retired:false,polls:[],selections:[],menu:null,
-    closed:!options.live&&!options.pendingOpening,metricTicks:0,marketTimer:null,menuOpens:0};
+    closed:!options.live&&!options.pendingOpening,metricTicks:0,marketTimer:null,menuOpens:0,
+    dismissals:0,purchases:0,paneResizes:0};
+  if(options.alreadyRetired)state.retired=true;
   document.getElementById('badge').textContent=state.closed?(options.label || 'Closed'):'Evaluation';
   const accounts=['Alpha','Beta'].map((name,index)=>({id:'fixture-'+index,name,category:'eval',identity:'eval:'+name,
     auto_discovered:true,balance:5000,equity:5000,unrealized_pnl:0,observed_at:Date.now()/1000,current:index===0}));
+  if(options.collapsedPane){
+    const group=document.createElement('div'),chart=document.createElement('div'),separator=document.createElement('div'),pane=document.createElement('div');
+    chart.id=options.invalidSeparator?'unrelated-chart':'trade-chart-activity';
+    separator.dataset.slot='resizable-handle';separator.setAttribute('role','separator');separator.setAttribute('aria-orientation','horizontal');separator.tabIndex=0;
+    pane.id='trade-account-tabs';pane.style.cssText='height:50px;overflow:hidden';
+    pane.append(document.querySelector('[data-testid="account-tab-active-positions"]'),document.getElementById('positions'));
+    separator.onkeydown=event=>{if(event.key==='ArrowUp'){state.paneResizes++;pane.style.height=(50+state.paneResizes*60)+'px';}};
+    group.append(chart,separator,pane);document.body.append(group);
+  }
+  const showTerminalDialog=()=>{if(options.dialog){
+    const modal=document.createElement('div');modal.setAttribute('role','dialog');
+    const title=options.unknownDialog?'Risk warning':options.dialog==='drawdown'?'Your Drawdown Ran Out':options.dialog==='english'?'Your Daily Loss Ran Out':'您的每日亏损额度已用完';
+    const description=options.dialog==='drawdown'?'Your account has reached its Drawdown Limit and is now closed.':options.dialog==='english'?'Your account has reached its Daily Loss Limit and is now closed. Review the trades below, or purchase a new Funded Account.':'您的账户已触及每日亏损上限，现已关闭。请查看下方交易，或购买新的 Funded Account。';
+    modal.innerHTML='<div data-slot="dialog-header"><h2 data-slot="dialog-title">'+title+'</h2><div class="text-muted-foreground">'+description+'</div></div><button id="paid-retry">重试 - $15 $14.25 重新购买 Silver Funded Account</button><a href="#history">查看历史</a><button id="terminal-close" type="button"><span>Close</span></button>';
+    document.body.append(modal);state.modal=modal;
+    modal.querySelector('#paid-retry').onclick=()=>state.purchases++;
+    modal.querySelector('#terminal-close').onclick=()=>{assert(state.retired,'Notice dismissed before archive acknowledgement');state.dismissals++;if(!options.stickyDialog)modal.remove();};
+    if(options.missingPanel){document.querySelector('[data-testid="account-tab-active-positions"]').remove();document.getElementById('positions').remove();}
+    if(options.extraDialog)document.body.insertAdjacentHTML('beforeend','<div role="alertdialog">Additional cost confirmation<button>Confirm</button></div>');
+  }};
+  if(state.closed)showTerminalDialog();
   const trigger=document.querySelector('[data-testid="account-selector-trigger"]');
   const close=()=>{state.menu?.remove();state.menu=null;trigger.setAttribute('aria-expanded','false');};
   const open=()=>{
@@ -27,6 +50,9 @@
       const item=document.createElement('div');item.dataset.testid='account-item-eval';item.setAttribute('role','menuitem');
       item.innerHTML='<span class="truncate">'+account.name+'</span><span>Evaluation</span>';
       item.onclick=()=>{state.selections.push(account.name);trigger.querySelector('.truncate').textContent=account.name;document.getElementById('badge').textContent='Evaluation';
+        if(options.missingPanel&&!document.getElementById('positions')){
+          document.body.insertAdjacentHTML('beforeend','<button data-testid="account-tab-active-positions" aria-selected="true" data-state="active" aria-controls="positions">Active Positions</button><div id="positions" role="tabpanel"><p>No positions yet</p></div>');
+        }
         document.querySelector('[data-testid="account-value"]').textContent='$5,000.00';legacyPnl.textContent='$0.00';document.getElementById('banner-pnl').textContent='$0.00';close();};
       menu.append(item);
     }
@@ -45,9 +71,10 @@
       if(message.type==='execution-next')return reply({next_account:state.polls.includes('fixture-1') || (options.idle && !state.retired)?null:{...accounts[state.retired?1:0],operation:options.pendingOpening&&!state.retired?'open':'monitor'}});
       if(message.type==='observe'){
         if(message.accounts.some(a=>a.name==='Alpha'&&['failed','closed'].includes(a.category)&&Date.now()/1000-a.status_observed_at<5))state.retired=true;
-        return reply({});
+        return reply(options.revokeDuringArchive?{mode:'readonly',mode_epoch:2}:{});
       }
       if(message.type==='poll'){
+        if(options.collapsedPane&&document.getElementById('trade-account-tabs').getBoundingClientRect().height<200)throw new Error('Polling leased work before the virtual positions table can render');
         if(options.live&&!state.closed&&message.snapshot.unrealized_pnl!==-state.metricTicks)throw new Error('Poll did not read current second-row unrealized PnL');
         state.polls.push(message.account_id);return reply({job:null});
       }
@@ -60,7 +87,12 @@
   const assert=(ok,message)=>{if(!ok)throw new Error(message);};
   globalThis.runFailedAccountFixtureTests=async()=>{
     await new Promise(resolve=>setTimeout(resolve,20));
-    assert((await send({type:'control-mode',mode:'execute',mode_epoch:1,session_id:'fixture-failed-session',accounts})).ok,'Enable fixture mode');
+    if(options.dialog&&!options.live){
+      const readOnly=await send({type:'prepare-execution',mode_epoch:1,session_id:'fixture-failed-session'});
+      assert(readOnly.ok===!(options.unknownDialog||options.extraDialog),'Terminal-notice preflight accepted an unrelated dialog or rejected a known closure');
+      assert(state.dismissals===0,'Read-only preflight dismissed the closure dialog');
+    }
+    assert((await send({type:'control-mode',mode:'execute',mode_epoch:1,session_id:'fixture-failed-session',accounts:registrations()})).ok,'Enable fixture mode');
     if (!state.closed) {
       document.querySelector('[data-testid="account-value"]').textContent='$5,000.00';
       legacyPnl.textContent='$0.00';document.getElementById('banner-pnl').textContent='$0.00';
@@ -90,13 +122,39 @@
       document.getElementById('positions').innerHTML='<p>No positions yet</p>';
       document.querySelector('[data-testid="account-value"]').textContent='****';
       legacyPnl.textContent='****';document.getElementById('banner-pnl').textContent='****';
+      showTerminalDialog();
     }
     await state.timer();
     assert(state.retired,'Explicit failure with hidden money was not published');
+    if(options.unknownDialog||options.extraDialog){
+      await state.timer();
+      assert(state.dismissals===0&&state.purchases===0&&state.selections.length===0,'An unrelated or additional risk dialog was bypassed');
+      assert(state.messages.some(m=>m.type==='execution-failed'),'Unknown dialog did not stop execution');
+      return{ok:true,checks:['unrecognized dialog is not dismissed','additional confirmation blocks account switching']};
+    }
+    if(options.revokeDuringArchive){
+      assert(state.dismissals===0&&state.purchases===0,'Permission revoked during archive still clicked the dialog');
+      return{ok:true,checks:['permission rechecked after asynchronous archive','no click after revocation']};
+    }
+    if(options.dialog){
+      assert(state.dismissals===1&&state.purchases===0,'Closure notice was not dismissed once without purchase');
+      if(options.stickyDialog){
+        await state.timer();await state.timer();
+        assert(state.dismissals===1&&state.selections.length===0,'A persistent notice was clicked repeatedly or bypassed');
+        assert(!state.messages.some(m=>m.type==='execution-failed'),'A known persistent notice revoked execute mode');
+        return{ok:true,checks:['one Close click','archive before dismissal','persistent notice waits','no paid retry']};
+      }
+    }
     assert(!state.messages.some(m=>m.type==='execution-failed'),'Failure switched every account to read-only');
     assert(state.polls.length===(options.live?3:0),'Failed account was polled or received trading work');
     await state.timer();
+    if(options.invalidSeparator){
+      assert(state.paneResizes===0&&state.polls.length===0,'An unrelated separator was resized or work was leased without readable positions');
+      assert(!state.messages.some(m=>m.type==='execution-failed'),'Pre-dispatch layout wait revoked execution');
+      return{ok:true,checks:['only verified positions separator may resize','no lease while layout is unreadable']};
+    }
     assert(state.selections.join()==='Beta','Failed account blocked selecting the next account');
+    if(options.collapsedPane)assert(state.paneResizes>0&&state.paneResizes<=8,'Collapsed virtual positions pane was not expanded before polling');
     assert(state.polls.join()===(options.live?'fixture-0,fixture-0,fixture-0,fixture-1':'fixture-1'),'Next healthy account was not observed');
     assert(state.menuOpens===1,'The account selector should open exactly once, to switch to Beta');
     assert(!state.messages.some(m=>m.type==='execution-failed'),'Next account could not continue execution');

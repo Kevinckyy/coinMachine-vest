@@ -58,6 +58,26 @@ class PhaseTests(unittest.TestCase):
         self.poll(a,balance=1000+pnl,equity=1000+pnl)
         return self.e.state()['accounts'][0]
 
+    def test_unconfirmed_missing_phase_preserves_original_read_error_without_settling_trade(self):
+        account,job=self.opening(confirmed=False)
+        result=self.e.bridge_result(dict(job_id=job['id'],session_id=self.sid,success=False,confirmed=False,
+            error='positions table is not rendered',snapshot={'observed_at':self.now,'position_open':None}))
+        self.assertEqual(result['status'],'unknown')
+        self.assertEqual(result['error'],'positions table is not rendered')
+        self.assertEqual(self.e.data['jobs'][job['id']]['phase'],'1/2')
+        self.assertFalse(self.e.data['positions'])
+        self.assertFalse(self.e.data['history'])
+        self.assertTrue(self.e._daily_entry_used(account['id']))
+
+    def test_confirmed_missing_phase_and_explicit_wrong_phase_still_cannot_confirm(self):
+        account,job=self.opening(confirmed=False)
+        for success,phase in [(True,None),(True,'2/2'),(False,'2/2')]:
+            with self.subTest(success=success,phase=phase),self.assertRaisesRegex(ValidationError,'回执阶段'):
+                self.e.bridge_result(dict(job_id=job['id'],session_id=self.sid,success=success,confirmed=success,
+                    snapshot={**self.snap(phase),'position_open':True}))
+        self.assertEqual(self.e.data['jobs'][job['id']]['status'],'delivered')
+        self.assertFalse(self.e.data['positions'])
+
     def test_same_day_each_phase_has_own_pnl_risk_metrics_baseline_and_daily_entry(self):
         a=self.complete()
         self.assertTrue(a['daily_entry_used'])

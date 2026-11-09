@@ -243,6 +243,8 @@ def create_server(engine, port=8765, host='127.0.0.1', static_dir=None,backtests
                     result = engine.close_position(path.split('/')[3])
                 elif path=='/api/strategy/start':
                     result = engine.start_strategy(body)
+                elif path=='/api/strategy/resume':
+                    result = engine.resume_strategy(body)
                 elif path=='/api/strategy/config':
                     result = engine.save_strategy_config(body)
                 elif path=='/api/strategy/stop':

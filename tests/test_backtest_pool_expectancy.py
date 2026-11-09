@@ -83,7 +83,7 @@ class PoolTests(unittest.TestCase):
         try:
             ids=[e.add_account(dict(name=str(i),initial_balance=1000,profit_target=100,max_loss=300))['id'] for i in range(6)]
             for aid in ids[-2:]:e.data['accounts'][aid]['phase']='live'
-            e.start_strategy(dict(account_ids=ids,batch_size=2,side='buy',symbol='NQ-PERP',quantity=1,
+            e.start_strategy(dict(account_ids=ids,batch_size=2,side='buy',symbol='NQ-PERP',quantity=1,live_default_locked=False,
                 order_delay_min=10,order_delay_max=10,batch_delay_min=0,batch_delay_max=0))
             e.tick(price=100)
             self.assertEqual(set(e.data['strategy']['batch_account_ids']),set(ids[-2:]))

@@ -98,6 +98,7 @@ class PhaseAccounting:
                                 'strategy_lock_source':None,'strategy_locked_at':None})
         if proof:
             account['external_position']=False
+        self._apply_live_strategy_default(account)
         strategy=self.data['strategy']
         if current:
             strategy['order_queue']=[a for a in strategy.get('order_queue',[]) if a!=aid]
