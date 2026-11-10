@@ -70,7 +70,8 @@ export default function LiveStrategySettings({value, onChange}: {
         <input aria-label="Live 利润领取比例" type="number" min="0.000001" max="100" step="any" required value={value.live_payout_percent}
           onChange={e=>onChange({live_payout_percent:Number(e.target.value)})}/></label>}
       <p className="form-footnote">默认领取全部可领取利润到主账户。金额和比例均按分润前的可领取利润计算，实际到账以 Vest 弹窗预览为准。</p>
-      <p className="form-footnote">当前仅保存领取参数，不会自动提交利润领取申请。</p>
+      <p className="form-footnote">Live 策略每单结束并确认空仓后，有净利润则按此参数领取到主账户。返回交易页核验余额恢复账号初始规模后，同一 Live 号当天继续下一单；手动锁定和风控限制保留。</p>
+      <p className="form-footnote">部分领取后余额未恢复初始规模时暂停新开仓；提交结果不明时先核对，不重复领取。修改参数只影响下次启动的策略。</p>
     </div>
   </section>;
 }

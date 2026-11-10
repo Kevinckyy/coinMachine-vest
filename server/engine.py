@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 from .trading_day import trading_day_window,entry_day_window
 from .phases import PhaseAccounting, PHASES, phase_rank
 from .strategies import catalogue,require_strategy,choose_live_first,choose_batch_side
+from .profit_claims import ProfitClaims
 
 NQ_TRADE_PATHS = {'/trade/NQ-PERP','/trade/NDX-USD-PERP'}
 STRATEGY_FORM_DEFAULTS = dict(strategy_id='random_entry',batch_size=2, order_delay_min=2, order_delay_max=8,
@@ -94,7 +95,7 @@ def execution_excluded(account):
                 or name in {'主账户','主账号','主帳戶','主帳號','main account','primary account','master account'})
 
 
-class Engine(PhaseAccounting):
+class Engine(PhaseAccounting, ProfitClaims):
     ACTIVE = {'running', 'waiting'}
     UNRESOLVED = {'queued', 'delivered', 'unknown'}
     CAPITAL_METRICS = ('daily_loss','drawdown','goal')
@@ -144,6 +145,7 @@ class Engine(PhaseAccounting):
         else:
             self.data = self._initial(seed)
         self.data.setdefault('preferences',{}).setdefault('auto_archive_failed',True)
+        self._init_profit_claims()
         self.data['strategy']['upcoming_account_ids'] = []
         self.data['strategy']['preparation'] = {'status':'inactive','accounts':{}}
         self._deduplicate_browser_accounts()
@@ -540,7 +542,7 @@ class Engine(PhaseAccounting):
                 account['evaluation_passed_at'] = self.clock() if prior is None else prior
             if not new_event and account['evaluation_passed_at'] < entry_day_window(self.clock())['start']:
                 return
-        priority = {'manual':0,'external_close':1,'daily_completed':1,'take_profit':2,'stop_loss':2,'target_reached':2,'evaluation_passed':3}
+        priority = {'manual':10,'external_close':1,'daily_completed':1,'take_profit':2,'stop_loss':2,'target_reached':2,'evaluation_passed':3}
         existing = account.get('strategy_lock_source')
         if account['strategy_locked'] and priority.get(existing,0) >= priority.get(source,0) and not (existing=='live_default' and source=='manual'):
             return
@@ -607,7 +609,7 @@ class Engine(PhaseAccounting):
             return not scope or self._quota_phase(account,record)==scope
         def today(value):
             timestamp = observed_time(value)
-            return period['start'] <= timestamp < period['end'] and timestamp <= self.clock()
+            return max(period['start'],self._claim_reentry_cutoff(account) if scope=='live' else 0) <= timestamp < period['end'] and timestamp <= self.clock()
         return (any(t['account_id']==aid and same_phase(t) and today(t.get('opened_at')) for t in self.data['history'])
                 or any(p['account_id']==aid and same_phase(p) and today(p.get('opened_at')) for p in self.data['positions'].values())
                 or any(j['account_id']==aid and j['type']=='open' and j['id']!=exclude_job_id
@@ -697,6 +699,8 @@ class Engine(PhaseAccounting):
     def _assert_settled_browser_actions(self):
         if self.data['mode']!='browser':
             return
+        if any(c['status'] in self.CLAIM_UNCERTAIN for c in self._pending_profit_claims()):
+            raise ValidationError('利润领取结果尚未核验，请在只读模式核对该 Live 号余额',409)
         for job in self.data['jobs'].values():
             if job['status'] in ('delivered','unknown'):
                 account=self.data['accounts'].get(job['account_id'],{})
@@ -896,6 +900,8 @@ class Engine(PhaseAccounting):
         return job
 
     def _open_one(self, aid, cfg, source):
+        if self.data['mode']=='browser' and self._pending_profit_claims():
+            raise ValidationError('Live 利润领取尚未核验，禁止新开仓',409)
         account = self._eligible(aid,for_strategy=source=='strategy')
         if source=='strategy':
             self._assert_strategy_batch_side(aid,cfg)
@@ -1034,6 +1040,7 @@ class Engine(PhaseAccounting):
 
     def start_strategy(self, body):
         with self.lock:
+            if self._pending_profit_claims():raise ValidationError('请先完成或核对原轮次的 Live 利润领取，不能新建轮次',409)
             if self.data['strategy']['status'] in self.ACTIVE:
                 raise ValidationError('策略已运行', 409)
             self._assert_settled_browser_actions()
@@ -1144,6 +1151,9 @@ class Engine(PhaseAccounting):
         s = self.data['strategy']
         if s['status'] not in self.ACTIVE:
             return
+        if self._pending_profit_claims():return
+        for claim in self.data['profit_claims'].values():
+            if claim['status']=='verified':self._schedule_claim_reentry(claim)
         cfg = s['config']
         if s['phase'] == 'monitoring':
             if any(self._strategy_outstanding(a) for a in s['batch_account_ids']):
@@ -1539,6 +1549,10 @@ class Engine(PhaseAccounting):
     def _revoke_execution(self, session, reason):
         """Revoke future clicks, never pretend a delivered action was recalled."""
         session['mode'] = 'readonly'
+        for claim in self._pending_profit_claims():
+            if claim['session_id']!=session['session_id']:continue
+            if claim['status']=='preparing':claim.update(status='queued',mode_epoch=None)
+            elif claim['status']=='submitted':claim.update(status='unknown',error='执行许可停止时领取结果未核验，禁止重复提交')
         affected = {a for a in session.get('account_ids',[]) if self.data['accounts'].get(a,{}).get('session_id')==session['session_id']}
         for job in self.data['jobs'].values():
             if job['account_id'] in affected and job['status']=='queued':
@@ -1760,7 +1774,7 @@ class Engine(PhaseAccounting):
             uncertain = any(j.get('session_id')==sid and j['status'] in ('delivered','unknown') for j in self.data['jobs'].values())
             if mode=='execute' and not heartbeat_only and (not uncertain or phase_reader):
                 jobs = sorted((j for j in self.data['jobs'].values() if j.get('session_id')==sid and j['status']=='queued'),
-                              key=lambda j:(j['type']!='close',j['created_at']))
+                              key=lambda j:(j['type']!='close',not self._is_live_account(self._account(j['account_id'])),j['created_at']))
                 candidates = [j['account_id'] for j in jobs]
                 if not candidates:
                     positions = [a for a in ids if self._position(a)]
@@ -1776,10 +1790,16 @@ class Engine(PhaseAccounting):
                     next_account['phase']=account.get('phase')
                     next_account['operation'] = 'monitor' if phase_reader==aid else next((j['type'] for j in jobs if j['account_id']==aid),'monitor')
             self.data['read_only_observation']['session_id'] = sid
+            profit_claim=self._claim_route(sid) if mode=='execute' and not heartbeat_only and not uncertain else None
+            if profit_claim and not any(j['type']=='close' for j in jobs):
+                a=self._account(profit_claim['account_id'])
+                next_account={k:a.get(k) for k in ('id','name','category','identity','phase')}
+                next_account['operation']='profit-claim'
+            else:profit_claim=None
             self._save()
             accounts = [a for a in self.state()['accounts'] if a['id'] in ids]
             return {'ok':True,'mode':mode,'mode_epoch':epoch,'session_id':sid,
-                    'accounts':accounts,'next_account':next_account,'preparation':{'active':False,'accounts':[],'disabled':True}}
+                    'accounts':accounts,'next_account':next_account,'profit_claim':profit_claim,'preparation':{'active':False,'accounts':[],'disabled':True}}
 
     def bridge_inspect(self, body):
         """Store a current DOM snapshot for explicit human reconciliation only."""
@@ -1893,6 +1913,7 @@ class Engine(PhaseAccounting):
                 for candidate in self.data['jobs'].values():
                     if candidate['account_id'] != aid or candidate['status']!='queued':
                         continue
+                    if candidate['type']=='open' and self._pending_profit_claims():continue
                     if candidate['type']=='open' and candidate.get('source')=='strategy':
                         try:self._assert_strategy_batch_side(aid,candidate)
                         except ValidationError as exc:
@@ -1956,6 +1977,7 @@ class Engine(PhaseAccounting):
         del self.data['positions'][position['id']]
         self._account_status(account)
         self._lock_strategy_exit(position,reason,pnl)
+        self._queue_profit_claim(position,trade,snapshot)
         self._log('info', f"{account['name']} 平仓已观察确认，余额变化 {pnl:+.2f} USDC")
 
     def bridge_size(self, body):
@@ -2377,7 +2399,7 @@ class Engine(PhaseAccounting):
             d = self.data
             result = {k: copy.deepcopy(d[k]) for k in ('mode','strategy','candles','market','preferences')}
             result['strategies']=catalogue()
-            result['capabilities']={'strategy_batch_same_side':True}
+            result['capabilities']={'strategy_batch_same_side':True,'live_profit_claims':True}
             result['accounts'] = copy.deepcopy([a for a in d['accounts'].values() if not a.get('merged_into')])
             result['positions'] = copy.deepcopy(list(d['positions'].values()))
             result['history'] = copy.deepcopy(sorted(d['history'], key=lambda h: h['closed_at'], reverse=True))
@@ -2401,6 +2423,7 @@ class Engine(PhaseAccounting):
                                 'jobs': [{k: j.get(k) for k in ('id','type','account_id','phase','status','created_at','error')} for j in d['jobs'].values()][-100:]}
             result['bridge']['execution_sessions'] = [{k:s.get(k) for k in ('session_id','mode','mode_epoch','last_seen','account_ids','error')}
                                                        for s in d['execution_sessions'].values()]
+            result['bridge']['profit_claims']=copy.deepcopy(list(d['profit_claims'].values())[-100:])
             result['connection'] = {'status': 'connected', 'server_time': now, 'paper': True,
                                     'market_source': 'simulated', 'browser_accounts': len(connected)}
             for account in result['accounts']:

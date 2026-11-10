@@ -140,12 +140,19 @@ async function updateConnection(tabId, state, failed, revision) {
 }
 
 async function checkedSession(tabId, state, options = {}, publish) {
-  const started = await connectionHealth(tabId);
-  try {
+  return checkedExecutionRead(tabId,state,async()=>{
     const observed = publish ? await publish() : {};
     const reply = await sessionRequest(tabId, { ...options, control_state: state });
+    return {...observed,...reply};
+  });
+}
+
+async function checkedExecutionRead(tabId, state, operation) {
+  const started = await connectionHealth(tabId);
+  try {
+    const reply = await operation();
     const health = reply.mode === 'execute' && !reply.stale_response ? await updateConnection(tabId, state) : null;
-    return { ...observed, ...reply, ...connectionFields(health) };
+    return { ...reply, ...connectionFields(health) };
   } catch (error) {
     if (state.mode !== 'execute' || error.code !== 'LOCAL_SERVICE_UNAVAILABLE') throw error;
     const health = await updateConnection(tabId, state, error, started?.revision);
@@ -288,7 +295,7 @@ async function ensureContentScript(tabId) {
     if (!chrome.scripting?.executeScript) throw new Error('扩展尚未加载新版脚本权限，请在扩展管理页重新加载 VEST Control，并允许访问 Vest 网站');
     try {
       await bounded(chrome.scripting.executeScript({
-        target: { tabId, frameIds: [0] }, world: 'ISOLATED', files: ['core.js', 'content.js'],
+        target: { tabId, frameIds: [0] }, world: 'ISOLATED', files: ['core.js', 'profit-claim.js', 'content.js'],
       }), 7000, '加载页面脚本超时');
     } catch (error) {
       throw new Error('无法连接 Vest 页面脚本：' + error.message + '。请检查扩展的站点访问权限，然后刷新 Vest 页面');
@@ -334,6 +341,11 @@ async function observationFailure(tabId, error) {
 function vestTab(url) {
   try { const parsed = new URL(url); return parsed.origin === 'https://next.vestmarkets.com' && ['/trade/NQ-PERP','/trade/NDX-USD-PERP'].includes(parsed.pathname.replace(/\/$/, '')); }
   catch { return false; }
+}
+
+function profitTab(url) {
+  try {const p=new URL(url);return p.origin==='https://next.vestmarkets.com'&&!p.username&&!p.password&&
+    ['/portfolio','/trade','/trade/NQ-PERP','/trade/NDX-USD-PERP'].includes(p.pathname.replace(/\/$/,''));}catch{return false;}
 }
 
 async function localRequest(path, body, token) {
@@ -386,6 +398,16 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       return await changeControlMode(message.tabId, message.mode, message.token);
     }
     if (message.type === 'execution-next' || message.type === 'mode-heartbeat') {
+      if (message.type==='mode-heartbeat' && sender.tab && message.profit_claim) {
+        if(!profitTab(sender.url))throw new Error('利润领取心跳来源无效');
+        const state=await controlState(sender.tab.id),observation=await observationConfig(sender.tab.id);
+        if(state.mode!=='execute')return state;
+        const p=message.profit_claim;
+        try {return await checkedExecutionRead(sender.tab.id,state,()=>localRequest('/api/bridge/profit-claim',{
+          action:'heartbeat',claim_id:p.claim_id,account_id:p.account_id,name:p.name,identity:p.identity,phase:p.phase,
+          session_id:observation.session_id,mode_epoch:state.mode_epoch,tab_url:sender.url,
+        },observation.token));}catch(error){await stopExecution(sender.tab.id,state,error);throw error;}
+      }
       if (message.type==='mode-heartbeat' && sender.tab && sender.url==='https://next.vestmarkets.com/portfolio') {
         const control=await controlState(sender.tab.id);
         const pending=(await chrome.storage.local.get('live-activation-tab:'+sender.tab.id))['live-activation-tab:'+sender.tab.id];
@@ -431,6 +453,30 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       await chrome.storage.local.set({[key]:pending,[tabKey]:pending});
       return pending;
       });
+    }
+    if(message.type==='profit-claim'){
+      const url=sender.url;
+      if(!sender.tab || !profitTab(url))throw new Error('利润领取来源无效');
+      const state=await controlState(sender.tab.id),observation=await observationConfig(sender.tab.id);
+      if(state.mode!=='execute'||message.mode_epoch!==state.mode_epoch)throw new Error('利润领取执行许可已变化');
+      const health=await connectionHealth(sender.tab.id);
+      if(health?.mode_epoch===state.mode_epoch&&health.blocked&&message.action!=='fail')throw new Error('本地连接待恢复，禁止领取操作');
+      if(!['reserve','intent','verify','fail'].includes(message.action))throw new Error('利润领取动作无效');
+      const result=await localRequest('/api/bridge/profit-claim',{
+        action:message.action,claim_id:message.claim_id,account_id:message.account_id,name:message.name,
+        identity:message.identity,phase:message.phase,session_id:observation.session_id,mode_epoch:state.mode_epoch,
+        tab_url:url,snapshot:message.snapshot,preview:message.preview,error:message.error,
+      },observation.token);
+      if(message.action==='verify' && result.claim?.status==='verified'){
+        // Publish only the just-verified DOM measurement. A pre-withdrawal row
+        // must not overwrite the reset balance in the next ordinary heartbeat.
+        const latest=await observationConfig(sender.tab.id),snapshot=message.snapshot;
+        const accounts=(latest.accounts||[]).map(a=>a.name===message.name?{...a,balance:snapshot.balance,equity:snapshot.equity,
+          unrealized_pnl:snapshot.unrealized_pnl,observed_at:snapshot.observed_at,phase_snapshot:snapshot}:a);
+        await chrome.storage.local.set({['observation:'+sender.tab.id]:{...latest,accounts}});
+      }
+      if(message.action==='fail')await stopExecution(sender.tab.id,state,new Error(message.error||'利润领取结果待核验'));
+      return result;
     }
     if (message.type === 'execution-failed') {
       if (!sender.tab || !vestTab(sender.url)) throw new Error('执行状态来源无效');

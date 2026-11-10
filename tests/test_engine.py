@@ -1009,6 +1009,12 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.request('POST','/api/strategy/config',body,extension)[0],403)
 
     def test_host_origin_and_bridge_token_are_enforced(self):
+        path='/api/bridge/profit-claim'
+        headers={'Content-Type':'application/json','Origin':'chrome-extension://'+'a'*32}
+        self.assertEqual(self.request('POST',path,{'action':'intent'},headers)[0],401)
+        headers['X-Bridge-Token']=self.engine.bridge_token
+        self.assertEqual(self.request('POST',path,{'action':'bogus'},headers)[0],400)
+        self.assertEqual(self.request('POST','/api/strategy/profit-claims/'+'a'*32+'/reconcile',{'acknowledge':True},headers)[0],403)
         self.assertEqual(self.request('GET','/api/state',headers={'Host':'evil.example'})[0],403)
         self.assertEqual(self.request('GET','/api/bridge/config',headers={'Origin':'https://evil.example'})[0],403)
         extension = 'chrome-extension://'+'a'*32

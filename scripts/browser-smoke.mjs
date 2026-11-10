@@ -134,7 +134,25 @@ try {
   }
     return failureContinuation;
   };
-  if(process.env.VEST_SMOKE_ACCOUNT_SCAN_ONLY==='1'){
+  const runProfitClaimFixtures=async()=>{
+    const results=[];
+    for(const options of [{},{precision:true},{mode:'amount'},{mode:'percent'},{recipient:true},{noReset:true},
+      {lostIntent:true},{revoke:true},{switchAccount:true},{sticky:true},{unknownSuccess:true},{orderOpen:true},{positionOpen:true}]){
+      await command('Page.navigate',{url:base+'/api/health'});
+      await until(()=>evaluate(`document.readyState==='complete'&&location.pathname==='/api/health'`),'profit claim fixture');
+      const fixture=await readFile(path.join(root,'tests','profit-claim-fixture.html'),'utf8');
+      await evaluate(`document.open();document.write(${JSON.stringify(fixture.replace(/<script>[\s\S]*?<\/script>/,''))});document.close();`);
+      await evaluate(`globalThis.profitClaimOptions=${JSON.stringify(options)}`);
+      await evaluate(fixture.match(/<script>([\s\S]*?)<\/script>/)[1]);
+      for(const file of ['core.js','profit-claim.js','content.js'])await evaluate(await readFile(path.join(root,'extension',file),'utf8'));
+      const result=await evaluate('runProfitClaimFixture()',30000);
+      assert.equal(result.ok,true,JSON.stringify(result));results.push(result);
+    }
+    return results;
+  };
+  if(process.env.VEST_SMOKE_PROFIT_CLAIM_ONLY==='1'){
+    console.log(JSON.stringify({profitClaims:await runProfitClaimFixtures()},null,2));
+  } else if(process.env.VEST_SMOKE_ACCOUNT_SCAN_ONLY==='1'){
     await command('Page.navigate',{url:base+'/api/health'});
     await until(()=>evaluate(`document.readyState==='complete' && location.pathname==='/api/health'`),'account timeout fixture');
     const fixture=await readFile(path.join(root,'tests','account-scan-timeout-fixture.html'),'utf8');
@@ -302,7 +320,8 @@ try {
   assert.equal(await evaluate(`document.querySelector('[aria-label="Live 利润领取金额"]').value`),'12.345678','inactive amount also survives reload');
   await setPayoutMode('all');
   await until(async()=>{const s=await(await fetch(base+'/api/state')).json();return s.preferences.strategy_config.live_payout_mode==='all';},'restore all-profit preference');
-  assert.equal(await evaluate(`document.querySelector('[aria-label="Live 利润领取参数"]').textContent.includes('不会自动提交')`),true,'saving a policy does not claim funds');
+  assert.equal(await evaluate(`document.querySelector('[aria-label="Live 利润领取参数"]').textContent.includes('确认空仓')`),true,'profit flow explains the completed-trade trigger');
+  assert.equal((await(await fetch(base+'/api/state')).json()).bridge.profit_claims.length,0,'saving a policy never creates a claim');
   await evaluate(`document.querySelector('[aria-label="仓位大小 75%"]').click()`);
   assert.equal(await evaluate(`document.querySelector('[aria-label="仓位大小 75%"]').getAttribute('aria-pressed')`),'true','position size selection updates');
   assert.equal(await evaluate(`document.querySelector('#strategy-form')?.textContent.includes('每账户合约数量')`),false,'strategy quantity has been renamed to position size');

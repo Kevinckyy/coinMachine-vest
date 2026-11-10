@@ -37,7 +37,7 @@ def create_server(engine, port=8765, host='127.0.0.1', static_dir=None,backtests
             allowed = {f'http://{name}:{p}' for name in ('localhost', '127.0.0.1') for p in (5173,4173,self.server.server_port)}
             if origin in allowed:
                 return origin
-            if re.fullmatch(r'chrome-extension://[a-p]{32}', origin) and self.path.split('?')[0] in ('/api/bridge/accounts', '/api/bridge/poll', '/api/bridge/result', '/api/bridge/observe','/api/bridge/session','/api/bridge/preparation','/api/bridge/size','/api/bridge/inspect','/api/backtests/cost-observation'):
+            if re.fullmatch(r'chrome-extension://[a-p]{32}', origin) and self.path.split('?')[0] in ('/api/bridge/accounts', '/api/bridge/poll', '/api/bridge/result', '/api/bridge/observe','/api/bridge/session','/api/bridge/preparation','/api/bridge/size','/api/bridge/inspect','/api/bridge/profit-claim','/api/backtests/cost-observation'):
                 return origin
             return None
 
@@ -51,7 +51,7 @@ def create_server(engine, port=8765, host='127.0.0.1', static_dir=None,backtests
                 raise ValidationError('无效 Host；服务仅供本机使用', 403)
             if self.headers.get('Origin') and self._origin() is None:
                 raise ValidationError('来源不被允许', 403)
-            if self.path.split('?')[0] in ('/api/bridge/accounts', '/api/bridge/poll', '/api/bridge/result', '/api/bridge/observe','/api/bridge/session','/api/bridge/preparation','/api/bridge/size','/api/bridge/inspect','/api/backtests/cost-observation'):
+            if self.path.split('?')[0] in ('/api/bridge/accounts', '/api/bridge/poll', '/api/bridge/result', '/api/bridge/observe','/api/bridge/session','/api/bridge/preparation','/api/bridge/size','/api/bridge/inspect','/api/bridge/profit-claim','/api/backtests/cost-observation'):
                 token = self.headers.get('X-Bridge-Token', '')
                 if not hmac.compare_digest(token, engine.bridge_token):
                     raise ValidationError('桥接配对码无效', 401)
@@ -245,6 +245,10 @@ def create_server(engine, port=8765, host='127.0.0.1', static_dir=None,backtests
                     result = engine.start_strategy(body)
                 elif path=='/api/strategy/resume':
                     result = engine.resume_strategy(body)
+                elif re.fullmatch(r'/api/strategy/profit-claims/[a-f0-9]{32}/reconcile',path):
+                    result = engine.reconcile_profit_claim(path.split('/')[4],body)
+                elif re.fullmatch(r'/api/strategy/profit-claims/[a-f0-9]{32}/cancel',path):
+                    result = engine.cancel_profit_claim(path.split('/')[4],body)
                 elif path=='/api/strategy/config':
                     result = engine.save_strategy_config(body)
                 elif path=='/api/strategy/stop':
@@ -265,6 +269,8 @@ def create_server(engine, port=8765, host='127.0.0.1', static_dir=None,backtests
                     result = engine.observe_accounts(body)
                 elif path=='/api/bridge/session':
                     result = engine.bridge_session(body)
+                elif path=='/api/bridge/profit-claim':
+                    result = engine.bridge_profit_claim(body)
                 elif path=='/api/bridge/preparation':
                     result = engine.bridge_preparation(body)
                 else:

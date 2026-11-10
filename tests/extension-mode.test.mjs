@@ -470,3 +470,53 @@ test('closed tabs release execution control records instead of retaining one ent
   }
   assert.equal(vm.runInContext('controlChanges.size',h.sandbox),0,'closed-tab control identifiers must be collectible');
 });
+
+
+test('profit claim Portfolio heartbeats check only the reserved claim and never authorize or fake an NQ session',async t=>{
+  const h=harness(t);await mode(h,'execute');
+  const state=(await h.dispatch({type:'control-status',tabId:42})).data;
+  const claim={claim_id:'a'.repeat(32),account_id:automatic[0].id,name:automatic[0].name,identity:automatic[0].identity,phase:'live'};
+  h.state.tabUrls[42]='https://next.vestmarkets.com/portfolio';
+  const sender={...pageSender,url:h.state.tabUrls[42],tab:{id:42,url:h.state.tabUrls[42]}};
+  h.state.fetchHandler=(r,response)=>r.url.endsWith('/api/bridge/profit-claim')?response({mode:'execute',mode_epoch:state.mode_epoch,claim_id:claim.claim_id}):undefined;
+  const before=h.state.requests.length;
+  const reply=await h.dispatch({type:'mode-heartbeat',profit_claim:claim},sender);
+  assert.equal(reply.data.mode,'execute');assert.equal(reply.data.mode_epoch,state.mode_epoch);
+  const requests=h.state.requests.slice(before);
+  assert.equal(requests.length,1);assert.ok(requests[0].url.endsWith('/api/bridge/profit-claim'));
+  assert.equal(requests[0].body.action,'heartbeat');assert.equal(requests[0].body.tab_url,sender.url);
+  assert.equal(requests[0].body.authorize,undefined);
+  assert.equal((await h.dispatch({type:'execution-next'},sender)).ok,false,'Portfolio never receives order polling authority');
+  assert.equal((await h.dispatch({type:'mode-heartbeat',profit_claim:claim},{...sender,url:'https://evil.example/portfolio'})).ok,false);
+});
+
+test('a lost profit intent response is sent once and a later readonly mode prevents another submission',async t=>{
+  const h=harness(t);await mode(h,'execute');
+  const state=(await h.dispatch({type:'control-status',tabId:42})).data;
+  const payload={type:'profit-claim',action:'intent',claim_id:'a'.repeat(32),account_id:automatic[0].id,
+    name:automatic[0].name,identity:automatic[0].identity,phase:'live',mode_epoch:state.mode_epoch,
+    preview:{available:40,amount:40,received:32,recipient:'main'}};
+  h.state.fetchHandler=r=>{if(r.url.endsWith('/api/bridge/profit-claim'))throw new TypeError('Lost intent response');};
+  const reply=await h.dispatch(payload,pageSender);
+  assert.equal(reply.ok,false);assert.equal(reply.code,'LOCAL_SERVICE_UNAVAILABLE');
+  assert.equal(h.state.requests.filter(r=>r.url.endsWith('/api/bridge/profit-claim')).length,1);
+  h.state.fetchHandler=null;await mode(h,'readonly');
+  assert.equal((await h.dispatch(payload,pageSender)).ok,false);
+  assert.equal(h.state.requests.filter(r=>r.url.endsWith('/api/bridge/profit-claim')).length,1);
+});
+
+
+test('verified payout balances replace stale observation rows before the next heartbeat',async t=>{
+  const h=harness(t);await mode(h,'execute');
+  const state=(await h.dispatch({type:'control-status',tabId:42})).data;
+  h.state.local['observation:42'].accounts[0].balance=5040;
+  h.state.fetchHandler=(r,response)=>r.url.endsWith('/api/bridge/profit-claim')?response({verified:true,claim:{status:'verified'}}):undefined;
+  const snapshot={phase:'live',position_open:false,balance:5000,equity:5000,unrealized_pnl:0,observed_at:Date.now()/1000};
+  assert.equal((await h.dispatch({type:'profit-claim',action:'verify',mode_epoch:state.mode_epoch,
+    claim_id:'a'.repeat(32),account_id:automatic[0].id,name:automatic[0].name,identity:automatic[0].identity,phase:'live',snapshot},pageSender)).ok,true);
+  h.state.fetchHandler=null;
+  await h.dispatch({type:'mode-heartbeat'},pageSender);
+  const last=h.state.requests.filter(r=>r.url.endsWith('/api/bridge/session')).at(-1).body;
+  assert.equal(last.accounts[0].balance,5000,'a heartbeat cannot restore the pre-withdrawal balance');
+  assert.equal(last.accounts[0].phase_snapshot.balance,5000);
+});

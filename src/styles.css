@@ -45,3 +45,5 @@
 
 .batch-direction-notice{display:flex;gap:12px;padding:16px 18px;margin:0 0 20px;border:1px solid #665127;border-radius:8px;background:#211d14;color:#e7b74a}.batch-direction-notice>svg{flex:0 0 19px;margin-top:2px}.batch-direction-notice strong{font-size:13px}.batch-direction-notice p{margin:7px 0 0;color:#c5b991;font-size:12px;line-height:1.8}.batch-direction-state{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0;color:#e7b74a;font-size:12px}
 .live-payout-settings h3{margin:0 0 12px;font-size:13px}.live-payout-settings input[readonly]{color:var(--muted);cursor:default}
+
+.profit-claim-status{margin-bottom:20px}.profit-claim-row{padding:14px 0;border-top:1px solid var(--border)}.profit-claim-row p,.profit-claim-row small{display:block;color:var(--muted);font-size:12px;line-height:1.7}.profit-claim-row .button{margin-top:10px}

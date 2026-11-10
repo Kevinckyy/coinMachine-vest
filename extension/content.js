@@ -1,7 +1,7 @@
 /* Operates only the public webpage DOM; never reads the website's credentials. */
 (() => {
   'use strict';
-  const VERSION = '0.3.23';
+  const VERSION = '0.3.24';
   const CONTROLLER = '__vestControlBridgeController';
   // A previous injection may belong to a reloaded extension context. Retire it
   // instead of trusting a boolean marker that can outlive its message listener.
@@ -34,6 +34,7 @@
   // DOM keys while still suppressing duplicate clicks on a persistent notice.
   let terminalDismissals = new WeakMap();
   let lastCostObservation = 0;
+  let profitClaimFlow = null;
   let preparationOnly = location.hash.startsWith('#vest-preparation=');
   let preparationGuardInstalled = false;
   let finishBoot;
@@ -1250,6 +1251,7 @@
     acceptConnection(reply);
     if (Array.isArray(reply?.accounts) && reply.accounts.length) sessionAccounts = reply.accounts;
     if (reply?.mode === 'readonly') {
+      profitClaimFlow?.dispose();
       executionMode = 'readonly'; preparingEpoch = null;
       executionEpoch = Math.max(executionEpoch, reply.mode_epoch || 0);
       if (config) config.armed = false;
@@ -1263,8 +1265,8 @@
     if (disposed || heartbeatBusy || executionMode !== 'execute' || Date.now() - lastModeHeartbeat < 2000) return;
     heartbeatBusy = true; lastModeHeartbeat = Date.now();
     const epoch = executionEpoch;
-    try { const reply=await call('mode-heartbeat'); if (epoch===executionEpoch) acceptSession(reply); }
-    catch (error) { if (epoch===executionEpoch) { executionMode = 'readonly'; if (config) config.armed = false; lastDiagnostic = error.message; } }
+    try { const reply=await call('mode-heartbeat',{profit_claim:profitClaimFlow?.heartbeat()}); if (epoch===executionEpoch) acceptSession(reply); }
+    catch (error) { if (epoch===executionEpoch) { profitClaimFlow?.dispose();executionMode = 'readonly'; if (config) config.armed = false; lastDiagnostic = error.message; } }
     finally { heartbeatBusy = false; }
   }
   async function executionTick() {
@@ -1275,12 +1277,17 @@
     let account = null;
     try {
       assertExecution(epoch);
+      if (await profitClaimFlow?.run(epoch)) return;
       if (await handleCurrentTerminal(epoch)) return;
       if (await advanceCompletedPhase(epoch)) return;
       const routed = await call('execution-next');
       acceptSession(routed);
       assertExecution(epoch);
       account = routed.next_account;
+      if (routed.profit_claim) {
+        if(!profitClaimFlow)throw new Error('利润领取模块未加载，请重新加载新版插件');
+        await profitClaimFlow.begin(routed.profit_claim,epoch);return;
+      }
       if (!account) {
         if (await reportCurrentTerminal()) return;
         // An enabled permission is idle until actual work exists. Keep the
@@ -1363,6 +1370,7 @@
         return;
       }
       if (executionMode === 'execute' && executionEpoch === epoch) {
+        profitClaimFlow?.dispose();
         executionMode = 'readonly'; preparingEpoch = null;
         if (config) config.armed = false;
         try { await call('execution-failed', { error: error.message, mode_epoch:epoch }); } catch {}
@@ -1451,6 +1459,7 @@
       if (message.mode === 'readonly') {
         const epoch = Number.isInteger(message.mode_epoch) ? message.mode_epoch : executionEpoch + 1;
         if (message.revoke || epoch >= executionEpoch) {
+          profitClaimFlow?.dispose();
           executionMode = 'readonly'; preparingEpoch = null; executionEpoch = Math.max(executionEpoch, epoch);
           if (config) config.armed = false;
         }
@@ -1458,6 +1467,7 @@
       }
       if (message.mode !== 'execute' || !message.session_id || !Array.isArray(message.accounts) || !message.accounts.length || !Number.isInteger(message.mode_epoch) || message.mode_epoch < executionEpoch) { respond({ ok: false, error: '执行授权已过期或账户未识别' }); return; }
       executionMode = 'execute'; executionEpoch = message.mode_epoch; executionSession = message.session_id;
+      profitClaimFlow?.dispose();
       connectionBlocked = false; connectionRevision = 0;
       sessionAccounts = message.accounts; observationEnabled = true; preparingEpoch = null;
       respond({ ok: true, mode: executionMode, mode_epoch: executionEpoch }); return;
@@ -1553,9 +1563,30 @@
     // The public controller may remain on window after an extension reload.
     // Release the retired actor's cached account data and weak-map metadata.
     config = null; observedAccounts = []; sessionAccounts = [];
+    profitClaimFlow?.dispose();
     phaseAdvance = null; liveAdvance = null; terminalDismissals = new WeakMap();
   }
   const instanceId = globalThis.crypto?.randomUUID?.() || String(Date.now()) + Math.random();
+  profitClaimFlow=globalThis.VestProfitClaimFlow?.create({
+    guard:assertExecution,identity:observerIdentity,visible,text:elementText,money:core.parseMoney,click,call,
+    isTrade:core.isNqTradePath,
+    async select(name,epoch){
+      const cached=observedAccounts.filter(a=>a.name===name);
+      if(cached.length!==1)throw new Error('领取账户无法唯一对应');
+      if(observerIdentity().name!==name)await observerSelect(cached[0],()=>assertExecution(epoch));
+    },
+    async flat(name,epoch){
+      const account=sessionAccounts.find(a=>a.name===name&&a.phase==='live');
+      if(!account)throw new Error('领取账户未登记为 Live');
+      config=autoConfig(account,false);
+      await prepareAccount(()=>assertExecution(epoch),false);
+      const values=await observerWaitStable(name,300,{monitoring:true,samples:3});
+      assertExecution(epoch);const proof=values.phase_snapshot;
+      if(!proof||proof.position_open!==false||proof.phase!=='live')throw new Error('领取账户缺少明确空仓证据');
+      for(const cached of observedAccounts){cached.current=cached.name===name;if(cached.current)Object.assign(cached,values);}
+      return proof;
+    },
+  })||null;
   globalThis[CONTROLLER] = { version: VERSION, protocol: 4, instance_id: instanceId, dispose };
   runtime.onMessage.addListener(messageHandler);
   chrome.storage.onChanged.addListener(storageHandler);

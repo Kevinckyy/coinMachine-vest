@@ -1,0 +1,97 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Isolated Live profit claim flow</title></head><body>
+<nav><a href="/portfolio">持仓</a><a href="/trade/NQ-PERP">交易</a></nav>
+<button data-testid="account-selector-trigger"><span class="truncate">Live QA</span><span>Funded</span></button>
+<div class="sticky top-14"><span data-slot="badge">Live Funded Account</span><span>杠杆: <span id="leverage">0x</span></span><span>仓位占用: <span id="position-margin">$0.00</span></span><span>订单占用: <span id="order-margin">$0.00</span></span><span style="display:none">杠杆:99x 仓位占用:$999 订单占用:$999</span></div>
+<section id="trade-page"><p data-testid="account-value">$5,040.00</p><p data-testid="account-upnl">$0.00</p><p data-testid="book-mark">$100.00</p>
+<button data-testid="account-tab-active-positions" aria-selected="true" aria-controls="positions">Active positions</button>
+<div id="positions"><p>No positions yet</p></div></section>
+<section id="portfolio-page" style="display:none"><button data-testid="withdraw-open" type="button">领取利润</button></section>
+<script>
+(() => {
+ const options=globalThis.profitClaimOptions||{};
+ const nativeTimeout=globalThis.setTimeout.bind(globalThis);
+ let clock=Date.now();Date.now=()=>clock;
+ globalThis.setTimeout=(fn,ms,...args)=>nativeTimeout(()=>{clock+=ms;fn(...args);},0);
+ const state={handler:null,timer:null,storage:{},clicks:0,intents:0,verifies:0,failed:0,normalPolls:0,
+   portfolioHeartbeats:0,readonly:false,balance:options.precision?5040.564943:5040};
+ const account={id:'profit-live-qa',name:'Live QA',phase:'live',category:'funded',identity:'funded:Live QA',
+  auto_discovered:true,current:true,initial_balance:5000,balance:state.balance,equity:state.balance,unrealized_pnl:0};
+ const claim={id:'a'.repeat(32),account_id:account.id,name:account.name,phase:'live',identity:account.identity,
+   status:'queued',target_balance:5000,policy:{live_payout_recipient:'main',live_payout_mode:options.mode||'all',
+   live_payout_amount:10,live_payout_percent:50}};
+ const assert=(ok,msg)=>{if(!ok)throw new Error(msg);};
+ const reply=data=>({ok:true,data:{mode:'execute',mode_epoch:1,accounts:[structuredClone(account)],...data}});
+ const money=()=>{document.querySelector('[data-testid="account-value"]').textContent='$'+state.balance.toFixed(2);};money();
+ function navigate(path){history.pushState(null,'',path);document.getElementById('trade-page').style.display=path==='/portfolio'?'none':'';document.getElementById('portfolio-page').style.display=path==='/portfolio'?'':'none';}
+ for(const link of document.querySelectorAll('nav a'))link.onclick=e=>{e.preventDefault();navigate(link.pathname);};
+ function open(){
+   const dialog=document.createElement('div');dialog.setAttribute('role','dialog');dialog.dataset.slot='dialog-content';
+   dialog.innerHTML='<h2 data-slot="dialog-title">领取利润</h2><form><div><span>收款人</span><input data-slot="input"><div><span>PA</span><span>主账户</span></div></div><input name="amount" data-slot="form-control" placeholder="0.00"><input data-slot="input" data-testid="claim-profit-amount-slider-percentage" aria-label="金额滑块百分比" value="0"><p data-testid="claim-profit-available">$'+(state.balance-5000).toFixed(6)+'</p><div><span>您将收到</span><span id="received">$0</span></div><button data-testid="claim-profit-submit" type="submit" disabled>领取利润</button></form><button data-slot="dialog-close" type="button">Close</button>';
+   const amount=dialog.querySelector('[name="amount"]'),percentage=dialog.querySelector('[data-testid="claim-profit-amount-slider-percentage"]');
+   const update=()=>{const n=Number(amount.value);dialog.querySelector('#received').textContent='$'+(Math.floor((n*.8)*1e6)/1e6);dialog.querySelector('[type="submit"]').disabled=!(n>0&&n<=state.balance-5000+.0000001);};
+   percentage.oninput=()=>{amount.value=String(Math.floor((state.balance-5000)*1e6*Number(percentage.value)/100+1e-7)/1e6);update();};
+   amount.oninput=update;
+   if(options.recipient)dialog.querySelector('input[data-slot="input"]').value='external-recipient';
+   if(options.orderOpen)document.getElementById('order-margin').textContent='$1.00';
+   if(options.positionOpen)document.getElementById('leverage').textContent='1x';
+   dialog.querySelector('form').onsubmit=e=>{e.preventDefault();assert(claim.status==='submitted','Financial click preceded durable intent');
+     state.clicks++;assert(state.clicks===1,'Claim submitted twice');
+     if(!options.noReset)state.balance=Math.round((state.balance-Number(amount.value))*1e6)/1e6;
+     account.balance=state.balance;account.equity=state.balance;money();
+     if(!options.sticky)dialog.remove();
+     if(options.unknownSuccess)document.body.insertAdjacentHTML('beforeend','<div role="dialog"><h2 data-slot="dialog-title">Unknown confirmation</h2><button>Confirm</button></div>');
+   };
+   dialog.querySelector('[data-slot="dialog-close"]').onclick=()=>dialog.remove();document.body.append(dialog);
+ }
+ document.querySelector('[data-testid="withdraw-open"]').onclick=open;
+ globalThis.setInterval=fn=>{state.timer=fn;return 1;};globalThis.clearInterval=()=>{};
+ Object.defineProperty(globalThis,'chrome',{configurable:true,value:{runtime:{id:'isolated-profit-claim',onMessage:{addListener:fn=>{state.handler=fn;},removeListener:()=>{}},
+  sendMessage:async m=>{
+    if(m.type==='observation-restore')return{ok:true,data:{enabled:true,accounts:[structuredClone(account)],mode_epoch:0}};
+    if(m.type==='mode-heartbeat'){if(location.pathname==='/portfolio'){assert(m.profit_claim?.claim_id===claim.id,'Portfolio heartbeat lacked its reserved claim');state.portfolioHeartbeats++;}return reply({});}
+    if(m.type==='execution-next')return reply({next_account:{...account,operation:claim.status==='verified'?'monitor':'profit-claim'},profit_claim:claim.status==='verified'?null:structuredClone(claim)});
+    if(m.type==='observe')return reply({});
+    if(m.type==='poll'){state.normalPolls++;assert(claim.status==='verified','Normal order polling occurred before balance verification');return reply({job:null});}
+    if(m.type==='profit-claim'){
+      assert(m.account_id===account.id&&m.name===account.name&&m.phase==='live','Claim identity mismatch');
+      if(m.action==='reserve'){assert(m.snapshot.position_open===false,'Claim lacks flat proof');claim.status='preparing';claim.mode_epoch=1;return reply({claim:structuredClone(claim)});}
+      if(m.action==='intent'){
+        state.intents++;assert(state.intents===1,'Intent was replayed');claim.status='submitted';
+        assert(m.preview.recipient==='main','Recipient was changed');
+        if(options.lostIntent)throw new Error('Lost intent response');
+        if(options.revoke){claim.status='unknown';state.readonly=true;await new Promise(resolve=>state.handler({type:'control-mode',mode:'readonly',mode_epoch:2},{},resolve));}
+        if(options.switchAccount)document.querySelector('.truncate').textContent='Other account';
+        return reply({claim:structuredClone(claim),authorize_click:true});
+      }
+      if(m.action==='verify'){
+        state.verifies++;assert(location.pathname==='/trade/NQ-PERP','Verification is not on the trading page');
+        assert(m.snapshot.position_open===false,'Verification lacks a flat snapshot');
+        if(Math.abs(m.snapshot.balance-5000)>.005){claim.status='balance_mismatch';return{ok:false,error:'领取后余额未恢复初始规模'};}
+        claim.status='verified';return reply({claim:structuredClone(claim),verified:true});
+      }
+      if(m.action==='fail'){state.failed++;if(claim.status==='submitted')claim.status='unknown';return reply({claim:structuredClone(claim)});}
+    }
+    if(m.type==='execution-failed'){state.readonly=true;return reply({mode:'readonly',mode_epoch:2});}
+    throw new Error('Unexpected fixture request '+m.type);
+  }},storage:{local:{get:async key=>({[key]:structuredClone(state.storage[key])}),set:async values=>Object.assign(state.storage,structuredClone(values))},onChanged:{addListener:()=>{},removeListener:()=>{}}}}});
+ history.replaceState(null,'','/trade/NQ-PERP');
+ const send=m=>new Promise(resolve=>state.handler(m,{},resolve));
+ globalThis.runProfitClaimFixture=async()=>{
+   await send({type:'bridge-ping'});
+   await send({type:'control-mode',mode:'execute',mode_epoch:1,session_id:'profit-claim-fixture',accounts:[account]});
+   for(let i=0;i<(options.sticky?100:14);i++){clock+=1000;await state.timer();}
+   const shouldFail=!!(options.mode||options.noReset||options.lostIntent||options.revoke||options.recipient||options.switchAccount||options.sticky||options.unknownSuccess||options.orderOpen||options.positionOpen);
+   if(shouldFail){
+     assert(state.readonly,'Unverified claim did not stop execution');
+     assert(state.normalPolls===0,'A trade was polled after an unverified claim');
+     assert(state.clicks===(options.recipient||options.lostIntent||options.revoke||options.switchAccount||options.orderOpen||options.positionOpen?0:1),'Unexpected financial click count');
+   }else{
+     assert(claim.status==='verified'&&state.verifies===1,'Balance reset was not verified exactly once');
+     assert(state.clicks===1&&state.intents===1,'Claim was not submitted exactly once');
+     assert(state.normalPolls>0&&!state.readonly,'Automatic observation did not continue after verification');
+     assert(state.portfolioHeartbeats>0,'Portfolio flow had no scoped heartbeat');
+   }
+   return {ok:true,options,counts:state,status:claim.status};
+ };
+})();
+</script></body></html>
