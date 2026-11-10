@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "VEST Control — Local Browser Bridge",
   "description": "Connect logged-in Vest accounts to local VEST Control for sequential account trading.",
-  "version": "0.3.21",
+  "version": "0.3.22",
   "permissions": ["storage", "activeTab", "scripting"],
   "host_permissions": ["https://next.vestmarkets.com/*", "http://127.0.0.1:8765/*"],
   "background": { "service_worker": "background.js" },

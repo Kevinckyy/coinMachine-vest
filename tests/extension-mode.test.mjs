@@ -82,6 +82,7 @@ function createHarness(options = {}) {
   };
   const sandbox = {
     chrome, URL, AbortController, console, crypto: webcrypto,
+    Date: class extends Date { static now() { return state.now ?? Date.now(); } },
     setTimeout: (callback, duration, ...args) => { const id = setTimeout(() => { state.timers.delete(id); callback(...args); }, duration); state.timers.add(id); return id; },
     clearTimeout: id => { clearTimeout(id); state.timers.delete(id); },
     fetch: async (url, init = {}) => {
@@ -357,4 +358,101 @@ test('upgrading closes owned old preparation windows and never reopens them', as
   assert.ok(h.state.removedTabs.includes(100));
   await mode(h,'execute');await h.dispatch({type:'mode-heartbeat'},pageSender);
   assert.equal(h.state.windows.length,0);
+});
+
+
+test('a transient local fetch failure blocks delivery and recovers only the existing execution epoch', async t => {
+  const h=harness(t);await mode(h,'execute');
+  const original=(await h.dispatch({type:'control-status',tabId:42})).data;
+  const authorizations=()=>h.state.requests.filter(r=>r.body?.authorize===true).length;
+  const grants=authorizations();
+  h.state.fetchHandler=r=>{if(r.url.endsWith('/api/bridge/session'))throw new TypeError('Failed to fetch');};
+  const failed=await h.dispatch({type:'mode-heartbeat'},pageSender);
+  assert.equal(failed.ok,true);assert.equal(failed.data.connection_pending,true);
+  assert.equal(failed.data.mode,'execute');assert.equal(failed.data.mode_epoch,original.mode_epoch);
+  assert.ok(h.state.messages.some(r=>r.message.type==='connection-state'&&r.message.connection_pending));
+  const count=h.state.requests.length;
+  const blocked=await h.dispatch({type:'poll',account_id:automatic[0].id,identity:automatic[0].identity,
+    session_id:original.session_id,mode_epoch:original.mode_epoch,ready:true},pageSender);
+  assert.equal(blocked.data.job,null);assert.equal(blocked.data.connection_pending,true);
+  assert.equal(h.state.requests.length,count,'no job polling during a connection hold');
+  h.state.fetchHandler=null;
+  const recovered=await h.dispatch({type:'mode-heartbeat'},pageSender);
+  assert.equal(recovered.data.connection_pending,false);assert.equal(recovered.data.mode_epoch,original.mode_epoch);
+  assert.equal(authorizations(),grants,'recovery never creates another authorization');
+  assert.equal(h.state.local['execution-error:42'].message,'');
+});
+
+test('a late failed heartbeat cannot block a newer successful check of the same epoch',async t=>{
+  const h=harness(t);await mode(h,'execute');
+  const waiting=deferred();let once=true;
+  h.state.fetchHandler=r=>{if(once&&r.url.endsWith('/api/bridge/session')){once=false;return waiting.promise;}};
+  const old=h.dispatch({type:'mode-heartbeat'},pageSender);
+  for(let i=0;i<5;i++)await flush();
+  const fresh=await h.dispatch({type:'mode-heartbeat'},pageSender);
+  waiting.reject(new TypeError('Failed to fetch'));
+  await old;
+  const current=(await h.dispatch({type:'control-status',tabId:42})).data;
+  assert.equal(current.mode,'execute');assert.equal(current.connection_pending,false);
+  assert.equal(current.connection_revision,fresh.data.connection_revision);
+});
+
+test('a sustained outage revokes execution and carries the original failure to later observations',async t=>{
+  const h=harness(t,{now:Date.now()});await mode(h,'execute');
+  const original=(await h.dispatch({type:'control-status',tabId:42})).data;
+  h.state.fetchHandler=r=>{if(r.url.endsWith('/api/bridge/session'))throw new TypeError('Failed to fetch');};
+  h.state.now+=1000;
+  assert.equal((await h.dispatch({type:'mode-heartbeat'},pageSender)).data.connection_pending,true);
+  h.state.now+=20000;
+  assert.equal((await h.dispatch({type:'mode-heartbeat'},pageSender)).ok,false);
+  const stopped=(await h.dispatch({type:'control-status',tabId:42})).data;
+  assert.equal(stopped.mode,'readonly');assert.equal(stopped.mode_epoch,original.mode_epoch+1);
+  assert.equal(stopped.revocation_source,'local-service-unavailable');
+  assert.match(h.state.local['execution-error:42'].message,/20 秒.*Failed to fetch/);
+  h.state.fetchHandler=null;
+  await h.dispatch({type:'observe',accounts:observed},pageSender);
+  const reported=h.state.requests.filter(r=>r.body?.mode==='readonly').at(-1).body;
+  assert.match(reported.execution_error,/Failed to fetch/);
+  assert.equal(reported.revocation_source,'local-service-unavailable');
+  assert.equal((await h.dispatch({type:'control-status',tabId:42})).data.mode,'readonly');
+});
+
+test('HTTP authorization denial and an actual readonly lease bypass connection recovery',async t=>{
+  const h=harness(t);await mode(h,'execute');
+  h.state.fetchHandler=()=>({ok:false,status:401,json:async()=>({error:'Execution permission denied'})});
+  assert.equal((await h.dispatch({type:'mode-heartbeat'},pageSender)).ok,false);
+  assert.equal((await h.dispatch({type:'control-status',tabId:42})).data.mode,'readonly');
+  h.state.fetchHandler=null;await mode(h,'execute');
+  h.state.fetchHandler=(r,response)=>r.url.endsWith('/api/bridge/session')?response({mode:'readonly',mode_epoch:r.body.mode_epoch,accounts:automatic}):undefined;
+  assert.equal((await h.dispatch({type:'mode-heartbeat'},pageSender)).data.mode,'readonly');
+  assert.equal((await h.dispatch({type:'control-status',tabId:42})).data.mode,'readonly');
+});
+
+test('an observation transport failure holds execution without authorizing or replaying an order',async t=>{
+  const h=harness(t);await mode(h,'execute');
+  h.state.fetchHandler=r=>{if(r.url.endsWith('/api/bridge/observe'))throw new TypeError('Failed to fetch');};
+  const reply=await h.dispatch({type:'observe',accounts:observed},pageSender);
+  assert.equal(reply.data.connection_pending,true);assert.equal(reply.data.mode,'execute');
+  h.state.fetchHandler=null;
+  assert.equal((await h.dispatch({type:'mode-heartbeat'},pageSender)).data.connection_pending,false);
+});
+
+test('a lost order poll response is never retried or softened into an observation hold',async t=>{
+  const h=harness(t);await mode(h,'execute');
+  const original=(await h.dispatch({type:'control-status',tabId:42})).data;
+  h.state.fetchHandler=r=>{if(r.url.endsWith('/api/bridge/poll'))throw new TypeError('Failed to fetch');};
+  const reply=await h.dispatch({type:'poll',account_id:automatic[0].id,identity:automatic[0].identity,
+    session_id:original.session_id,mode_epoch:original.mode_epoch,ready:true},pageSender);
+  assert.equal(reply.ok,false);assert.equal(reply.code,'LOCAL_SERVICE_UNAVAILABLE');
+  assert.equal(h.state.requests.filter(r=>r.url.endsWith('/api/bridge/poll')).length,1);
+  assert.equal((await h.dispatch({type:'control-status',tabId:42})).data.connection_pending,false);
+});
+
+test('a truncated successful HTTP response holds execution but malformed JSON stops it',async t=>{
+  const h=harness(t);await mode(h,'execute');
+  h.state.fetchHandler=r=>r.url.endsWith('/api/bridge/session')?{ok:true,status:200,json:async()=>{throw new TypeError('network stream interrupted');}}:undefined;
+  assert.equal((await h.dispatch({type:'mode-heartbeat'},pageSender)).data.connection_pending,true);
+  h.state.fetchHandler=r=>r.url.endsWith('/api/bridge/session')?{ok:true,status:200,json:async()=>{throw new SyntaxError('invalid JSON');}}:undefined;
+  assert.equal((await h.dispatch({type:'mode-heartbeat'},pageSender)).ok,false);
+  assert.equal((await h.dispatch({type:'control-status',tabId:42})).data.mode,'readonly');
 });

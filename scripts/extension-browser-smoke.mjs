@@ -39,6 +39,7 @@ const executionSessions = new Map();
 let queuedOpen = null;
 let monitorAccount = false;
 let observationGate = null;
+let serviceUnavailable = false;
 let cancelledJobDeliveries = 0;
 let preparationPlan = null;
 const preparationObservations = [];
@@ -58,6 +59,7 @@ const api = createServer(async (request, response) => {
   };
   if (request.method === 'OPTIONS') return send(204, {});
   if (request.headers['x-bridge-token'] !== fakeToken) return send(401, { error: 'Fixture token mismatch' });
+  if (serviceUnavailable && ['/api/bridge/session','/api/bridge/observe'].includes(request.url)) return request.socket.destroy();
   if (request.url === '/api/bridge/accounts') return send(200, { accounts: [] });
   if (request.url === '/api/bridge/session' && request.method === 'POST') {
     let raw = '';
@@ -303,6 +305,25 @@ try {
   assert.equal(await vestPage.evaluate('window.__fixture.selections.length'),idleSelections,'idle mode cannot switch accounts');
   assert.equal(await vestPage.evaluate(`!!document.querySelector('[data-testid="order-form"]')`),false);
   assert.equal(await vestPage.evaluate('window.__fixture.tradeClicks'),0);
+
+  const connected=(await call({type:'control-status',tabId})).data;
+  const grantsBeforeOutage=sessionRequests.filter(r=>r.authorize===true).length;
+  serviceUnavailable=true;
+  await until(async()=>{const reply=await call({type:'control-status',tabId});return reply.data?.connection_pending;},'real fetch failure enters a connection hold');
+  await until(()=>popup.evaluate(`document.getElementById('modeBadge').textContent==='等待连接'`),'popup explains the connection hold');
+  const heldPolls=pollRequests.length;
+  const heldSelections=await vestPage.evaluate('window.__fixture.selections.length');
+  monitorAccount=true;
+  await pause(2500);
+  assert.equal(pollRequests.length,heldPolls,'connection hold prevents receiving another order');
+  assert.equal(await vestPage.evaluate('window.__fixture.selections.length'),heldSelections,'connection hold prevents account switching');
+  assert.equal(await vestPage.evaluate('window.__fixture.tradeClicks'),0,'connection hold prevents trade clicks');
+  monitorAccount=false;serviceUnavailable=false;
+  await until(async()=>{const reply=await call({type:'control-status',tabId});return reply.data?.mode==='execute'&&!reply.data.connection_pending;},'fresh same-epoch heartbeat recovers from a real fetch failure');
+  const recovered=(await call({type:'control-status',tabId})).data;
+  assert.equal(recovered.mode_epoch,connected.mode_epoch,'connection recovery retains the original grant');
+  assert.equal(sessionRequests.filter(r=>r.authorize===true).length,grantsBeforeOutage,'connection recovery never reauthorizes');
+  await until(()=>popup.evaluate(`document.getElementById('modeBadge').textContent==='执行'`),'popup leaves the connection hold');
   await until(()=>popup.evaluate(`document.getElementById('modeSwitch').checked && !document.getElementById('modeSwitch').disabled`),'idle main-account switch finishes');
   await popup.evaluate(`document.getElementById('modeSwitch').click()`);
   await until(async()=>{const state=await call({type:'control-status',tabId});return state.data?.mode==='readonly';},'idle execute permission is revoked');

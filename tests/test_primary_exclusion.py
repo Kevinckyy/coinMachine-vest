@@ -106,6 +106,18 @@ class PrimaryExclusionTests(unittest.TestCase):
         self.assertEqual(self.engine.state()['bridge']['execution_sessions'][0]['error'],'')
         self.assertEqual(self.engine.state()['strategy']['status'],'paused','permission recovery must not resume a real strategy')
 
+    def test_transport_revocation_preserves_cause_and_does_not_regrant_on_reconnect(self):
+        self.session()
+        reason='本地服务连接中断超过 20 秒：Failed to fetch'
+        self.session(epoch=2,mode='readonly',authorize=False,heartbeat_only=True,
+                     execution_error=reason,revocation_source='local-service-unavailable')
+        event=next(row for row in reversed(self.engine.data['audit']) if row.get('event')=='execution_permission_revoked')
+        self.assertEqual(event['source'],'local-service-unavailable')
+        self.assertEqual(event['error'],reason)
+        reply=self.session(epoch=2,mode='execute',authorize=False,heartbeat_only=True)
+        self.assertEqual(reply['mode'],'readonly')
+        self.assertEqual(self.engine.state()['bridge']['execution_sessions'][0]['error'],reason)
+
     def test_primary_detection_uses_exact_names_or_type_without_hiding_normal_accounts(self):
         reply = self.session([('主账号','eval'),('Main Account','unknown'),('Wallet 1','default'),
                               ('Main Account 2','eval'),('主账户 2','eval')])

@@ -8,7 +8,9 @@ let changing = false;
 let modeRequest = 0;
 let preparationOnly = false;
 let initialized = false;
+let connectionPending = false;
 const extensionVersion = chrome.runtime.getManifest().version;
+$('extensionVersion').textContent = `账户自动识别 · ${extensionVersion}`;
 function renderExecutionError(details) {
   $('executionError').hidden = !details?.message;
   $('executionError').textContent = details?.message ? `上次执行错误（${new Date(details.time).toLocaleTimeString()}）：${details.message}` : '';
@@ -30,6 +32,10 @@ function renderMode(next) {
   $('modeSwitch').checked = mode === 'execute';
   $('modeBadge').textContent = mode === 'execute' ? '执行' : '只读';
   $('modeDescription').textContent = mode === 'execute' ? '工作台可向已识别的账户下单或运行策略；账户和页面状态会自动校验。' : '只同步账户信息；工作台不能向此页面发送交易操作。';
+  if (mode === 'execute' && connectionPending) {
+    $('modeBadge').textContent = '等待连接';
+    $('modeDescription').textContent = '本地服务连接暂时中断，已暂停页面操作；原执行授权核验通过后继续，连续断线超过 20 秒则切回只读。';
+  }
   $('readAccounts').disabled = scanActive || mode === 'execute';
   $('modeSwitch').disabled = scanActive || !initialized;
   $('scanTimeout').disabled = scanActive || !initialized;
@@ -72,15 +78,17 @@ async function init() {
   const statusKey = 'observation-status:' + tab.id;
   const modeKey = 'control-mode:' + tab.id;
   const errorKey = 'execution-error:' + tab.id;
+  const connectionKey = 'connection-health:' + tab.id;
   const saved = await chrome.storage.local.get([observationKey, statusKey, errorKey,'account-scan-settings']);
   try {$('scanTimeout').value=VestBridgeCore.accountScanTimeoutSeconds(saved['account-scan-settings']?.timeout_seconds??3);} catch {$('scanTimeout').value=3;}
   renderExecutionError(saved[errorKey]);
   $('token').value = saved[observationKey]?.token || '';
   summary(saved[observationKey]?.accounts);
   showObservation(saved[statusKey]);
-  try { const current = await background({ type: 'control-status', tabId: tab.id }); preparationOnly = current.preparation === true; renderMode(current.mode); } catch { renderMode('readonly'); }
+  try { const current = await background({ type: 'control-status', tabId: tab.id }); preparationOnly = current.preparation === true; connectionPending = !!current.connection_pending; renderMode(current.mode); } catch { renderMode('readonly'); }
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'session' && changes[modeKey]) renderMode(changes[modeKey].newValue?.mode);
+    if (area === 'session' && changes[connectionKey]) { connectionPending = !!changes[connectionKey].newValue?.blocked; renderMode(mode); }
     if (area === 'local' && changes[statusKey]) showObservation(changes[statusKey].newValue);
     if (area === 'local' && changes[observationKey]) summary(changes[observationKey].newValue?.accounts);
     if (area === 'local' && changes[errorKey]) renderExecutionError(changes[errorKey].newValue);

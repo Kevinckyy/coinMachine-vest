@@ -7,6 +7,8 @@ const scanStarts = new Map();
 const controlChanges = new Map();
 const modeWrites = new Map();
 const activationWrites = new Map();
+const connectionWrites = new Map();
+const CONNECTION_GRACE_MS = 20000; // Shorter than the server's 30-second execution lease.
 const volatileModes = {};
 const PREPARATION_HASH = '#vest-preparation=';
 const modeStorage = chrome.storage.session || {
@@ -107,6 +109,70 @@ async function saveExecutionError(tabId, error, epoch) {
   await chrome.storage.local.set({ [key]: { message, time:new Date().toISOString(), mode_epoch:epoch } });
 }
 
+async function connectionHealth(tabId) {
+  return (await modeStorage.get('connection-health:' + tabId))['connection-health:' + tabId];
+}
+
+function connectionFields(health) {
+  return health ? { connection_pending: !!health.blocked, connection_revision: health.revision,
+    connection_error: health.error || '' } : {};
+}
+
+async function updateConnection(tabId, state, failed, revision) {
+  const write = (connectionWrites.get(tabId) || Promise.resolve()).catch(() => {}).then(async () => {
+    const current = await controlState(tabId);
+    if (current.mode !== 'execute' || current.mode_epoch !== state.mode_epoch) return null;
+    const previous = await connectionHealth(tabId);
+    const same = previous?.mode_epoch === state.mode_epoch;
+    // A failed old request cannot undo a newer successful lease check.
+    if (failed && same && previous.revision !== revision) return previous;
+    const health = { mode_epoch: state.mode_epoch, revision: (previous?.revision || 0) + 1,
+      last_success_at: failed ? same ? previous.last_success_at : 0 : Date.now(),
+      blocked: !!failed, error: failed ? String(failed.message || failed).slice(0, 400) : '' };
+    await modeStorage.set({ ['connection-health:' + tabId]: health });
+    void chrome.tabs.sendMessage(tabId, { type: 'connection-state', mode_epoch: state.mode_epoch,
+      ...connectionFields(health) }, { frameId: 0 }).catch(() => {});
+    return health;
+  });
+  connectionWrites.set(tabId, write);
+  try { return await write; } finally { if (connectionWrites.get(tabId) === write) connectionWrites.delete(tabId); }
+}
+
+async function checkedSession(tabId, state, options = {}, publish) {
+  const started = await connectionHealth(tabId);
+  try {
+    const observed = publish ? await publish() : {};
+    const reply = await sessionRequest(tabId, { ...options, control_state: state });
+    const health = reply.mode === 'execute' && !reply.stale_response ? await updateConnection(tabId, state) : null;
+    return { ...observed, ...reply, ...connectionFields(health) };
+  } catch (error) {
+    if (state.mode !== 'execute' || error.code !== 'LOCAL_SERVICE_UNAVAILABLE') throw error;
+    const health = await updateConnection(tabId, state, error, started?.revision);
+    if (!health) throw error;
+    if (Date.now() - health.last_success_at < CONNECTION_GRACE_MS) {
+      return { ...state, ...connectionFields(health), accounts: [], next_account: null,
+        // Even an obsolete failed request cannot supply a trading route.
+        stale_response: !health.blocked };
+    }
+    error.message = '本地服务连接中断超过 20 秒，已停止执行：' + error.message;
+    await stopExecution(tabId, state, error, 'local-service-unavailable');
+    throw error;
+  }
+}
+
+async function stopExecution(tabId, state, error, source = 'execution-check-failed') {
+  const latest = await controlState(tabId);
+  if (latest.mode_epoch !== state.mode_epoch || latest.mode !== 'execute') return;
+  void revokeActor(tabId);
+  const readonly = { ...latest, mode: 'readonly', mode_epoch: latest.mode_epoch + 1,
+    revocation_source: source, execution_error: String(error.message || error).slice(0, 500) };
+  await saveControl(tabId, readonly);
+  await saveExecutionError(tabId, error, readonly.mode_epoch);
+  await closePreparation(tabId);
+  // Persist the reason first: the next observation can report it after an outage.
+  void sessionRequest(tabId, { heartbeat_only: true, control_state: readonly }).catch(() => {});
+}
+
 async function sessionRequest(tabId, options = {}) {
   const observation = await observationConfig(tabId);
   const state = options.control_state ? { ...options.control_state } : await controlState(tabId);
@@ -118,7 +184,7 @@ async function sessionRequest(tabId, options = {}) {
     ...(options.current_account ? { current_account: options.current_account } : {}),
     heartbeat_only: !!options.heartbeat_only,
     ...(state.revocation_source ? { revocation_source: state.revocation_source } : {}),
-    ...(options.execution_error ? {execution_error:String(options.execution_error).slice(0,500)} : {}),
+    ...((options.execution_error || state.execution_error) ? {execution_error:String(options.execution_error || state.execution_error).slice(0,500)} : {}),
     ...(options.authorize === true ? { authorize: true, mode: 'execute' } : {}),
   }, observation.token);
   const latest = await controlState(tabId);
@@ -146,7 +212,8 @@ async function changeControlMode(tabId, requested, token, failureReason = '') {
   controlChanges.set(tabId, changeId);
   const observation = await observationConfig(tabId);
   const current = await controlState(tabId);
-  let state = { session_id: observation.session_id, mode: 'readonly', mode_epoch: Math.max(observation.mode_epoch || 0, current.mode_epoch || 0) + 1 };
+  let state = { session_id: observation.session_id, mode: 'readonly', mode_epoch: Math.max(observation.mode_epoch || 0, current.mode_epoch || 0) + 1,
+    ...(failureReason ? {execution_error:failureReason, revocation_source:'execution-check-failed'} : {}) };
   await saveControl(tabId, state);
   if (token) {
     const saved = await observationConfig(tabId);
@@ -177,6 +244,7 @@ async function changeControlMode(tabId, requested, token, failureReason = '') {
     if (!validChange() || granted.stale_response || granted.mode !== 'execute') throw new Error('执行权限未生效，请检查账户状态后重试');
     const active = { ...state, mode: 'execute', mode_epoch: granted.mode_epoch ?? state.mode_epoch };
     await saveControl(tabId, active);
+    await updateConnection(tabId, active);
     const configured = await sendPageCommand(tabId, { type: 'control-mode', ...active, accounts: granted.accounts }, validChange);
     if (!configured?.ok) throw new Error(configured?.error || '页面未能启用执行模式');
     if (!validChange()) throw new Error('模式切换已取消');
@@ -271,13 +339,24 @@ async function localRequest(path, body, token) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
   try {
-    const response = await fetch(ENDPOINT + path, {
+    let response;
+    try { response = await fetch(ENDPOINT + path, {
       method: body === undefined ? 'GET' : 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Bridge-Token': token || '' },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: controller.signal,
-    });
-    const result = await response.json();
+    }); } catch (error) {
+      const failure = new Error(`${path}：${controller.signal.aborted ? '本地请求超时（8 秒）' : error.message}`);
+      failure.code = 'LOCAL_SERVICE_UNAVAILABLE';
+      throw failure;
+    }
+    let result;
+    try { result = await response.json(); } catch (error) {
+      if (response.ok && (controller.signal.aborted || error.name === 'TypeError' || error.name === 'AbortError')) {
+        throw Object.assign(new Error(`${path}：本地响应中断或超时：${error.message}`), {code:'LOCAL_SERVICE_UNAVAILABLE'});
+      }
+      throw error;
+    }
     if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
     return result;
   } finally { clearTimeout(timeout); }
@@ -297,7 +376,9 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     if (['preparation-next','preparation-observed','preparation-error'].includes(message.type)) throw new Error('此标签页不是预备窗口');
     if (message.type === 'control-status') {
       if (!extensionPage(sender)) throw new Error('控制模式仅可从插件查看');
-      return await controlState(message.tabId);
+      const control = await controlState(message.tabId);
+      const health = await connectionHealth(message.tabId);
+      return { ...control, ...(health?.mode_epoch === control.mode_epoch ? connectionFields(health) : {}) };
     }
     if (message.type === 'control-mode') {
       if (!extensionPage(sender)) throw new Error('只读/执行只能通过插件开关控制');
@@ -320,15 +401,9 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       const state = await controlState(sender.tab.id);
       if (state.mode !== 'execute') return { ...state, accounts: [], next_account: null };
       try {
-        return await sessionRequest(sender.tab.id, { heartbeat_only: message.type === 'mode-heartbeat', current_account: message.current_account });
+        return await checkedSession(sender.tab.id, state, { heartbeat_only: message.type === 'mode-heartbeat', current_account: message.current_account });
       } catch (error) {
-        const latest = await controlState(sender.tab.id);
-        if (latest.mode_epoch===state.mode_epoch && latest.mode==='execute') {
-          void revokeActor(sender.tab.id);
-          await closePreparation(sender.tab.id);
-          await saveControl(sender.tab.id, { ...latest, mode: 'readonly', mode_epoch: latest.mode_epoch + 1 });
-          await saveExecutionError(sender.tab.id,error,latest.mode_epoch+1);
-        }
+        await stopExecution(sender.tab.id, state, error);
         throw error;
       }
     }
@@ -450,6 +525,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
         return { enabled: !!observation?.enabled, accounts: observation?.accounts || [], ...readonly };
       }
       if ((!observation?.enabled && !message.progress?.done) || !observation?.token) throw new Error('只读连接未配对或已停止');
+      const state = await controlState(sender.tab.id);
       const accounts = Array.isArray(message.accounts) ? message.accounts : [];
       const progress = message.progress || null;
       const previousStatus=(await chrome.storage.local.get('observation-status:'+sender.tab.id))['observation-status:'+sender.tab.id];
@@ -462,9 +538,8 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
         const latest = await chrome.storage.local.get(observationKey);
         await chrome.storage.local.set({ [observationKey]: { ...latest[observationKey], enabled: false } });
       }
-      const result = await localRequest('/api/bridge/observe', { tab_url: sender.url, accounts, error: message.error || '', progress }, observation.token);
-      const session = await sessionRequest(sender.tab.id, { heartbeat_only: true });
-      return { ...result, ...session };
+      return await checkedSession(sender.tab.id, state, { heartbeat_only: true }, () =>
+        localRequest('/api/bridge/observe', { tab_url: sender.url, accounts, error: message.error || '', progress }, observation.token));
     }
     if (message.type === 'accounts') {
       if (!extensionPage(sender)) throw new Error('仅扩展设置页可以读取账户列表');
@@ -503,6 +578,8 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       const observation = await observationConfig(sender.tab.id);
       const state = await controlState(sender.tab.id);
       if (state.mode!=='execute' || message.mode_epoch!==state.mode_epoch || message.session_id!==observation.session_id) throw new Error('执行权限已更新，禁止开仓');
+      const health = await connectionHealth(sender.tab.id);
+      if (health?.mode_epoch === state.mode_epoch && health.blocked) throw Object.assign(new Error('本地连接待恢复，暂停操作'), {code:'EXECUTION_CONNECTION_PENDING'});
       const account = observation.registrations?.find(account=>account.id===message.account_id && account.identity===message.identity);
       if (!account) throw new Error('无法核对仓位大小对应的账户');
       if (account.execution_excluded) throw new Error('主账户永久排除所有执行');
@@ -523,6 +600,8 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
         if (message.session_id !== observation.session_id) throw new Error('页面账户会话不匹配');
         if (message.type === 'poll') {
           if (state.mode !== 'execute' || message.mode_epoch !== state.mode_epoch) return { job: null, mode: state.mode, mode_epoch: state.mode_epoch };
+          const health = await connectionHealth(sender.tab.id);
+          if (health?.mode_epoch === state.mode_epoch && health.blocked) return {job:null, ...state, ...connectionFields(health)};
           const account = observation.registrations?.find(account => account.id === message.account_id && account.identity === message.identity);
           if (!account) throw new Error('账户尚未自动识别或名称已变化');
           if (account.execution_excluded) throw new Error('主账户永久排除所有执行');
@@ -555,7 +634,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       }, config.token);
     }
     throw new Error('未知桥接消息');
-  })().then((data) => respond({ ok: true, data })).catch((error) => respond({ ok: false, error: error.message }));
+  })().then((data) => respond({ ok: true, data })).catch((error) => respond({ ok: false, error: error.message, code:error.code }));
   return true;
 });
 
@@ -577,6 +656,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     }
     await chrome.storage.local.remove(['tab:' + tabId, 'status:' + tabId, key, 'observation-status:' + tabId, 'execution-error:' + tabId]);
     try { await modeStorage.remove?.('control-mode:' + tabId); } catch {}
+    try { await modeStorage.remove?.('connection-health:' + tabId); } catch {}
   })().catch(() => {});
 });
 

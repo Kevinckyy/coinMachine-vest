@@ -1,7 +1,7 @@
 /* Operates only the public webpage DOM; never reads the website's credentials. */
 (() => {
   'use strict';
-  const VERSION = '0.3.21';
+  const VERSION = '0.3.22';
   const CONTROLLER = '__vestControlBridgeController';
   // A previous injection may belong to a reloaded extension context. Retire it
   // instead of trusting a boolean marker that can outlive its message listener.
@@ -22,6 +22,8 @@
   let executionMode = 'readonly';
   let executionEpoch = 0;
   let executionSession = null;
+  let connectionBlocked = false;
+  let connectionRevision = 0;
   let sessionAccounts = [];
   let preparingEpoch = null;
   let heartbeatBusy = false;
@@ -56,6 +58,7 @@
   const elementText = (el) => el instanceof HTMLInputElement ? el.value : core.normalized(el?.textContent);
   const unknownSnapshot = () => ({ equity: null, balance: null, unrealized_pnl: null, price: null, entry_price: null, position_open: null, position_id: null, symbol: null, side: null, quantity: null, observed_at: Date.now() / 1000 });
   function assertArmed(job) {
+    assertConnection();
     assertExecutableAccount();
     assertLive();
     if (preparationOnly) throw new Error('预备窗口为只读，禁止任何交易操作');
@@ -493,7 +496,7 @@
       if (/context invalidated|Extension context|Receiving end/i.test(error.message)) dispose();
       throw error;
     }
-    if (!result?.ok) throw new Error(result?.error || '本地桥接无响应');
+    if (!result?.ok) throw Object.assign(new Error(result?.error || '本地桥接无响应'), {code:result?.code});
     return result.data;
   }
   async function tick() {
@@ -1224,10 +1227,22 @@
   function assertExecution(epoch) {
     assertLive();
     if (executionMode !== 'execute' || executionEpoch !== epoch) throw new Error('插件已切回只读或权限已更新');
+    assertConnection();
+  }
+  function assertConnection() {
+    if (connectionBlocked) throw Object.assign(new Error('本地连接暂时中断，暂停操作等待原授权核验'), {code:'EXECUTION_CONNECTION_PENDING'});
+  }
+  function acceptConnection(reply) {
+    if (reply?.mode_epoch !== executionEpoch || executionMode !== 'execute' ||
+        !Number.isInteger(reply.connection_revision) || reply.connection_revision < connectionRevision) return;
+    connectionRevision = reply.connection_revision;
+    connectionBlocked = !!reply.connection_pending;
+    if (connectionBlocked) lastDiagnostic = '本地连接暂时中断，暂停操作等待恢复：' + (reply.connection_error || '');
   }
   function acceptSession(reply) {
     if (reply?.stale_response) return;
     if (reply?.mode_epoch !== undefined && reply.mode_epoch < executionEpoch) return;
+    acceptConnection(reply);
     if (Array.isArray(reply?.accounts) && reply.accounts.length) sessionAccounts = reply.accounts;
     if (reply?.mode === 'readonly') {
       executionMode = 'readonly'; preparingEpoch = null;
@@ -1254,6 +1269,7 @@
     let receivedJob = null;
     let account = null;
     try {
+      assertExecution(epoch);
       if (await handleCurrentTerminal(epoch)) return;
       if (await advanceCompletedPhase(epoch)) return;
       const routed = await call('execution-next');
@@ -1327,6 +1343,7 @@
       }
     } catch (error) {
       lastDiagnostic = error.message;
+      if (!receivedJob && error.code === 'EXECUTION_CONNECTION_PENDING') return;
       if (!receivedJob) {
         try { if (await advanceCompletedPhase(epoch)) return; }
         catch (phaseError) { error = phaseError; lastDiagnostic = phaseError.message; }
@@ -1421,6 +1438,7 @@
       if (!bootReady) { booted.then(answer); return true; }
       answer(); return;
     }
+    if (message.type === 'connection-state') { acceptConnection(message); respond({ok:true}); return; }
     if (preparationOnly && !(message.type === 'control-mode' && message.mode === 'readonly')) {
       respond({ ok:false,error:'此窗口固定只读，仅用于下一批账户预备' }); return;
     }
@@ -1435,6 +1453,7 @@
       }
       if (message.mode !== 'execute' || !message.session_id || !Array.isArray(message.accounts) || !message.accounts.length || !Number.isInteger(message.mode_epoch) || message.mode_epoch < executionEpoch) { respond({ ok: false, error: '执行授权已过期或账户未识别' }); return; }
       executionMode = 'execute'; executionEpoch = message.mode_epoch; executionSession = message.session_id;
+      connectionBlocked = false; connectionRevision = 0;
       sessionAccounts = message.accounts; observationEnabled = true; preparingEpoch = null;
       respond({ ok: true, mode: executionMode, mode_epoch: executionEpoch }); return;
     }

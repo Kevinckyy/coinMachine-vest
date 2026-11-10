@@ -1734,7 +1734,7 @@ class Engine(PhaseAccounting):
                         '执行授权轮次不一致，已切回只读' if requested=='execute' else '插件已切换只读模式')
                 self.data['audit'].append({'event':'execution_permission_revoked','time':now,
                     'session_id':sid,'previous_epoch':prior_epoch,'requested_epoch':epoch,
-                    'requested_mode':requested,'source':source if source=='page-actor-restore' else 'mode-request',
+                    'requested_mode':requested,'source':source if source in ('page-actor-restore','local-service-unavailable','execution-check-failed') else 'mode-request',
                     'error':execution_error})
                 self.data['audit']=self.data['audit'][-1000:]
                 self._revoke_execution(session,reason)
