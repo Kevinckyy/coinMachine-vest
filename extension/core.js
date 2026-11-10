@@ -169,5 +169,14 @@
     if (!/^(?:评估通过|Evaluation Passed)$/i.test(normalized(title))) return false;
     return /^(?:恭喜\s*-\s*您已通过评估阶段。\s*您的\s*\$[\d,]+(?:\.\d+)?\s*Funded Account\s*现已转为实盘。|Congratulations\s*-\s*you've passed the Evaluation Phase\.\s*Your\s+\$[\d,]+(?:\.\d+)?\s+Funded Account is now live\.)$/i.test(normalized(description));
   }
-  root.VestBridgeCore = { FIELDS, defaults, parseMoney, normalized, isNqTradePath, canonicalNqPosition, CAPITAL_INDICATORS, parseCapitalMetric, accountCategory, terminalNoticeReason, liveActivationNotice, accountPhase, positionState, parseSide, sameQuantity, nqInputToVest, nqVestToInput, matchesPosition, executionExcluded, assertExecutionAllowed, validateJob, strategyStopLoss };
+  function accountScanTimeoutSeconds(value=3) {
+    if (typeof value!=='number' || !Number.isFinite(value) || value<0.5 || value>120) throw new Error('单账号读取超时须为 0.5–120 秒');
+    return value;
+  }
+  function accountScanIdleTimeoutMs(progress) {
+    let seconds=3;
+    try {seconds=accountScanTimeoutSeconds(progress?.account_timeout_seconds??3);} catch {}
+    return Math.max(65000,seconds*1000+20000);
+  }
+  root.VestBridgeCore = { FIELDS, defaults, parseMoney, normalized, isNqTradePath, canonicalNqPosition, CAPITAL_INDICATORS, parseCapitalMetric, accountCategory, terminalNoticeReason, liveActivationNotice, accountScanTimeoutSeconds, accountScanIdleTimeoutMs, accountPhase, positionState, parseSide, sameQuantity, nqInputToVest, nqVestToInput, matchesPosition, executionExcluded, assertExecutionAllowed, validateJob, strategyStopLoss };
 })(globalThis);

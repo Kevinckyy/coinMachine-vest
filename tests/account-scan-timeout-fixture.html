@@ -1,0 +1,71 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Isolated per-account scan deadlines</title></head><body>
+<button data-testid="account-selector-trigger" aria-expanded="false"><span class="truncate">Scan 0</span><span>Evaluation</span></button>
+<p data-testid="account-value">$1,000.00</p><p data-testid="account-upnl">$0.00</p><p data-testid="book-mark">$100.00</p>
+<div class="sticky top-14"><span data-slot="badge">Step 1/2</span></div>
+<button data-testid="account-tab-active-positions" aria-selected="true" aria-controls="scan-positions">Active Positions</button><div id="scan-positions"><p>No positions yet</p></div>
+<button data-testid="submit-long">Forbidden trade</button><button data-testid="submit-short">Forbidden trade</button>
+<script>
+(() => {
+ const realTimeout=setTimeout.bind(window),realNow=Date.now.bind(Date);
+ const state={time:realNow(),handler:null,timer:null,accounts:[],uploads:[],selected:0,menu:null,pending:null,clicks:[],trades:0,stuck:null,slow:null,delay:0,stopAfter:null,stopped:false};
+ Date.now=()=>state.time;
+ function flush(){if(state.pending&&state.time>=state.pending.at){renderMoney(state.pending.account);state.pending=null;}}
+ window.setTimeout=(fn,ms=0,...args)=>realTimeout(()=>{state.time+=ms;flush();fn(...args);},0);
+ window.setInterval=fn=>{state.timer=fn;return 1;};
+ const clone=x=>structuredClone(x),assert=(v,m)=>{if(!v)throw new Error(m);};
+ const trigger=document.querySelector('[data-testid="account-selector-trigger"]'),money=document.querySelector('[data-testid="account-value"]');
+ function renderMoney(a){money.textContent='$'+(1000+a.index).toFixed(2);money.removeAttribute('aria-busy');}
+ function renderIdentity(a){state.selected=a.index;trigger.firstElementChild.textContent=a.name;trigger.lastElementChild.textContent='Evaluation';}
+ function close(){state.menu?.remove();state.menu=null;trigger.setAttribute('aria-expanded','false');}
+ function select(a){
+  state.clicks.push({name:a.name,at:state.time});close();
+  if(a.index===state.stuck)return;
+  renderIdentity(a);
+  if(a.index===state.slow){money.setAttribute('aria-busy','true');state.pending={account:a,at:state.time+state.delay};}
+  else{state.pending=null;renderMoney(a);}
+ }
+ function open(){
+  if(state.menu)return;
+  const menu=document.createElement('div');menu.dataset.slot='dropdown-menu-content';menu.setAttribute('role','menu');
+  menu.onkeydown=e=>{if(e.key==='Escape')close();};
+  for(const a of state.accounts){const row=document.createElement('button');row.dataset.testid='account-item-eval';row.innerHTML='<span class="truncate">'+a.name+'</span><span>Step 1/2</span>';row.onclick=()=>select(a);menu.append(row);}
+  state.menu=menu;document.body.append(menu);trigger.setAttribute('aria-expanded','true');
+ }
+ trigger.onkeydown=e=>{if(e.key==='ArrowDown')open();if(e.key==='Escape')close();};trigger.onpointerdown=()=>state.menu?close():open();trigger.onclick=()=>state.menu?close():open();
+ for(const b of document.querySelectorAll('[data-testid^="submit-"]'))b.onclick=()=>{state.trades++;throw new Error('Scan clicked a trade');};
+ const send=m=>new Promise(resolve=>state.handler(m,{},resolve));
+ Object.defineProperty(window,'chrome',{configurable:true,value:{runtime:{id:'scan-timeout-fixture',onMessage:{addListener:h=>{state.handler=h;}},sendMessage:async m=>{
+  if(m.type==='observation-restore')return{ok:true,data:{enabled:false,accounts:[]}};
+  if(m.type==='observe'){
+   state.uploads.push(clone({...m,at:state.time}));
+   if(state.stopAfter!==null&&!state.stopped&&m.progress?.completed>=state.stopAfter&&!m.progress.done){state.stopped=true;await send({type:'observation-stop'});}
+   return{ok:true,data:{ok:true}};
+  }
+  throw new Error('Scan attempted a trading/network message: '+m.type);
+ }},storage:{local:{get:async()=>({}),set:async()=>{}},onChanged:{addListener:()=>{}}}}});
+ function setup(count=3,options={}){
+  close();state.pending=null;
+  Object.assign(state,{time:realNow(),uploads:[],clicks:[],trades:0,selected:0,stuck:null,slow:null,delay:0,stopAfter:null,stopped:false,...options});
+  state.accounts=Array.from({length:count},(_,index)=>({index,name:'Scan '+index}));renderIdentity(state.accounts[0]);renderMoney(state.accounts[0]);
+ }
+ const scan=seconds=>send({type:'observe-accounts',...(seconds===undefined?{}:{account_timeout_seconds:seconds})});
+ globalThis.runAccountScanTimeoutFixtureTests=async()=>{
+  await new Promise(r=>realTimeout(r,10));const checks=[];
+  setup();let result=await scan();assert(result.ok&&result.succeeded===3&&result.failed===0&&result.unread===0&&result.restored,'Default scan failed');
+  assert(state.uploads.at(-1).progress.account_timeout_seconds===3,'Default is not 3 seconds');assert(state.selected===0,'Original account not restored');checks.push('default 3 seconds, exact counts, original account restored');
+  setup(100);const start=state.time;result=await scan();assert(result.ok&&result.succeeded===100&&result.failed===0,'Long scan stopped before all 100 accounts');const largeElapsed=state.time-start;assert(largeElapsed>45000,'Fixture did not exceed old total deadline');checks.push('100 accounts complete beyond 45 seconds without a global deadline');
+  setup(3,{slow:1,delay:10000});result=await scan(3);assert(result.accounts[1].observed_at===null&&result.accounts[1].read_error.includes('3 秒'),'Slow account not timed out independently');assert(result.accounts[2].balance===1002,'Next account not read or received stale money');assert(result.succeeded===2&&result.failed===1&&result.unread===0&&result.restored,'Timeout counts or restoration wrong');checks.push('slow account times out and following account still reads correct money');
+  setup(3,{stuck:1});result=await scan(3);assert(result.failed===1&&result.succeeded===2&&result.accounts[2].balance===1002,'Unconfirmed switch stopped the whole scan or read the wrong account');checks.push('switch timeout skips the account without late detached actions');
+  setup(3,{slow:1,delay:4200});result=await scan(5);assert(result.succeeded===3&&result.failed===0&&result.accounts[1].balance===1001,'Configured 5 seconds was cut off by the old 4-second wait');checks.push('custom deadline replaces internal account waits and preserves loading checks');
+  setup(3,{slow:1,delay:600});result=await scan(3);assert(result.accounts[1].balance===1001,'Old cash leaked through accelerated sampling');checks.push('delayed cash with loading marker is never read from the previous account');
+  setup(3,{stopAfter:1});result=await scan(3);assert(result.succeeded===1&&result.unread===2&&result.restored,'Stop lost partial results or failed to restore');checks.push('manual stop preserves partial results and restores original account');
+  setup();const clicks=state.clicks.length;result=await scan(0);assert(!result.ok&&state.clicks.length===clicks,'Invalid timeout performed selection');checks.push('invalid timeout is rejected before page actions');
+  setup();const ack=await send({type:'observe-start-scan',account_timeout_seconds:3});assert(ack.ok&&ack.started&&ack.account_timeout_seconds===3,'Scan did not acknowledge independently');
+  for(let i=0;i<1000&&!state.uploads.some(u=>u.progress?.done);i++)await new Promise(r=>realTimeout(r,1));
+  assert(state.uploads.some(u=>u.progress?.done&&u.progress.succeeded===3),'Scan depended on initiating popup');checks.push('asynchronous scan finishes without its initiating popup');
+  assert(state.trades===0,'Scan performed a trade');
+  return{ok:true,checks,large_scan_elapsed_ms:largeElapsed};
+ };
+ setup();history.replaceState(null,'','/trade/NQ-PERP');
+})();
+</script></body></html>

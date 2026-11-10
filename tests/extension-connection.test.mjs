@@ -73,6 +73,7 @@ function harness(options = {}) {
       return { ok: true, status: 200, json: async () => ({ ok: true, accounts: [] }) };
     },
   };
+  sandbox.importScripts = file => { if(file !== 'core.js') throw new Error('Unexpected worker script'); vm.runInContext(fs.readFileSync(new URL('../extension/core.js', import.meta.url), 'utf8'),sandbox); };
   vm.createContext(sandbox);
   vm.runInContext(backgroundSource, sandbox, { filename: 'extension/background.js' });
   const popupSender = { id: EXTENSION_ID, url: `chrome-extension://${EXTENSION_ID}/popup.html`, origin: `chrome-extension://${EXTENSION_ID}` };
@@ -224,6 +225,7 @@ test('account scanning answers immediately and progresses independently of the i
   assert.equal(start.data.started, true);
   assert.equal(h.state.storage['observation:42'].enabled, true);
   assert.equal(h.business().filter(item => item.message.type === 'observe-start-scan').length, 1);
+  assert.equal(h.business().find(item=>item.message.type==='observe-start-scan').message.account_timeout_seconds,3);
   // The initiating popup no longer participates: the page reports its own result.
   const result = await h.dispatch({ type: 'observe', accounts: [], error: '', progress: { completed: 0, total: 0, done: true, restored: true } }, { id: EXTENSION_ID, tab: { id: 42 }, url: VEST_URL });
   assert.equal(result.ok, true);
@@ -243,6 +245,39 @@ test('two popups starting the same scan cannot disable the one accepted scan', a
   assert.equal(h.business().filter(item => item.message.type === 'observe-start-scan').length, 1);
   assert.equal(h.state.storage['observation:42'].enabled, true, 'a rejected concurrent start must not stop the accepted background scan');
   assert.notEqual(h.state.storage['observation-status:42'].phase, 'error');
+});
+
+test('saved per-account scan timeout is passed to the page and long reads retain the active scan',async t=>{
+  const h=useHarness(t,{ready:true,storage:{'account-scan-settings':{timeout_seconds:7.5}}});
+  const start=await h.dispatch({type:'observe-start',tabId:42,token:'fixture-pairing-only'});
+  assert.equal(start.ok,true,start.error);
+  assert.equal(h.business().find(item=>item.message.type==='observe-start-scan').message.account_timeout_seconds,7.5);
+  h.state.storage['observation-status:42']={phase:'scanning',time:new Date(Date.now()-100000).toISOString(),progress:{account_timeout_seconds:120}};
+  const duplicate=await h.dispatch({type:'observe-start',tabId:42,token:'fixture-pairing-only'});
+  assert.equal(duplicate.ok,false);assert.match(duplicate.error,/仍在进行/);
+  assert.equal(h.state.storage['observation:42'].enabled,true);
+});
+
+test('completed scan counts survive subsequent current-account observations',async t=>{
+  const summary={completed:3,total:3,succeeded:2,failed:1,unread:0,done:true,restored:true,account_timeout_seconds:3};
+  const h=useHarness(t,{ready:true,storage:{'observation:42':{enabled:true,token:'fixture-pairing-only'},'observation-status:42':{phase:'complete',progress:summary}}});
+  const result=await h.dispatch({type:'observe',accounts:[],error:''},{id:EXTENSION_ID,tab:{id:42},url:VEST_URL});
+  assert.equal(result.ok,true,result.error);
+  assert.deepEqual(h.state.storage['observation-status:42'].progress,summary);
+  assert.equal(h.state.storage['observation-status:42'].phase,'observing');
+});
+
+test('stopping a scan keeps its controls busy until the page reports restoration complete',async t=>{
+  const h=useHarness(t,{ready:true,storage:{'observation:42':{enabled:true,token:'fixture-pairing-only'},
+    'observation-status:42':{phase:'scanning',progress:{completed:1,total:3,succeeded:1,failed:0,unread:2}}},
+    commandHandler:async m=>m.type==='observation-stop'?{ok:true,scan_running:true}:{ok:true}});
+  const result=await h.dispatch({type:'observe-stop',tabId:42});assert.equal(result.ok,true,result.error);
+  assert.equal(h.state.storage['observation-status:42'].phase,'stopping');
+  assert.equal(h.state.storage['observation-status:42'].progress.done,false);
+  const finished=await h.dispatch({type:'observe',accounts:[],progress:{completed:1,total:3,succeeded:1,failed:0,unread:2,done:true,restored:true}},
+    {id:EXTENSION_ID,tab:{id:42},url:VEST_URL});
+  assert.equal(finished.ok,true,finished.error);
+  assert.equal(h.state.storage['observation-status:42'].phase,'complete');
 });
 
 test('stopping after receiver loss disables observation without re-injecting scripts', async (t) => {

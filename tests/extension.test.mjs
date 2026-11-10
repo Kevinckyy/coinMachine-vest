@@ -16,6 +16,15 @@ test('Live activation notice requires both completed evaluation and explicitly l
   for(const [title,description] of [['付款完成',zh],['第 1 阶段已完成！',zh],['评估通过','请购买新的 Funded Account'],['Evaluation Passed',en.replace('is now live','may become live')]])assert.equal(parse(title,description),false);
 });
 
+test('account scan timeout defaults to three seconds and validates finite numeric settings',()=>{
+  const parse=sandbox.VestBridgeCore.accountScanTimeoutSeconds;
+  assert.equal(parse(),3);
+  for(const value of [0.5,3,7.5,120])assert.equal(parse(value),value);
+  for(const value of [0,-1,120.1,NaN,Infinity,null,'3',true])assert.throws(()=>parse(value),/0.5/);
+  assert.equal(sandbox.VestBridgeCore.accountScanIdleTimeoutMs(),65000);
+  assert.equal(sandbox.VestBridgeCore.accountScanIdleTimeoutMs({account_timeout_seconds:120}),140000);
+});
+
 test('terminal notice classification requires an observed closure, not a risk warning or paid retry',()=>{
   const parse=sandbox.VestBridgeCore.terminalNoticeReason;
   assert.equal(parse('您的每日亏损额度已用完','您的账户已触及每日亏损上限，现已关闭。请查看下方交易，或购买新的 Funded Account。'),'daily_loss');

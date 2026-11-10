@@ -1,4 +1,5 @@
 'use strict';
+importScripts('core.js');
 const ENDPOINT = 'http://127.0.0.1:8765';
 const BRIDGE_PROTOCOL = 4;
 const contentConnections = new Map();
@@ -383,9 +384,12 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
         await changeControlMode(message.tabId, 'readonly');
         scanStarts.delete(message.tabId);
         await chrome.storage.local.set({ [observationKey]: { ...saved[observationKey], enabled: false } });
-        try { await bounded(chrome.tabs.sendMessage(message.tabId, { type: 'observation-stop' }, { frameId: 0 }), 1500, '停止连接超时'); }
+        let stopResponse=null;
+        try { stopResponse=await bounded(chrome.tabs.sendMessage(message.tabId, { type: 'observation-stop' }, { frameId: 0 }), 1500, '停止连接超时'); }
         catch { /* Stopping a disconnected tab must never inject or restart it. */ }
-        await chrome.storage.local.set({ ['observation-status:' + message.tabId]: { time: new Date().toISOString(), phase: 'stopped', progress: null, error: '', count: saved[observationKey]?.accounts?.length || 0 } });
+        const latest=(await chrome.storage.local.get('observation-status:'+message.tabId))['observation-status:'+message.tabId];
+        const stopping=stopResponse?.scan_running && !latest?.progress?.done;
+        await chrome.storage.local.set({ ['observation-status:' + message.tabId]: { time: new Date().toISOString(), phase: stopping?'stopping':'stopped', progress: stopping?{...latest?.progress,stopping:true,done:false}:latest?.progress?.done?latest.progress:null, error: '', count: saved[observationKey]?.accounts?.length || 0 } });
         return { ok: true };
       }
       if (scanStarts.has(message.tabId)) throw new Error('正在连接此标签页，请稍候或先停止读取');
@@ -395,7 +399,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       try {
         const previousStatus = await chrome.storage.local.get('observation-status:' + message.tabId);
         const status = previousStatus['observation-status:' + message.tabId];
-        if (status?.phase === 'scanning' && Date.now() - Date.parse(status.time) < 65000) {
+        if (status?.phase === 'scanning' && Date.now() - Date.parse(status.time) < VestBridgeCore.accountScanIdleTimeoutMs(status.progress)) {
           const activeScan = new Error('账户扫描仍在进行，请查看读取进度或先停止读取');
           activeScan.preserveObservation = true;
           throw activeScan;
@@ -416,7 +420,9 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
           const configured = await sendPageCommand(message.tabId, { type: 'configure', config: binding, tabKey: bindingKey });
           if (!configured?.ok) throw new Error(configured?.error || '无法停用原交易执行，请先核对标签页');
         }
-        const response = await sendPageCommand(message.tabId, { type: 'observe-start-scan' }, () => scanStarts.get(message.tabId) === startId);
+        const scanSettings=(await chrome.storage.local.get('account-scan-settings'))['account-scan-settings'];
+        const accountTimeout=VestBridgeCore.accountScanTimeoutSeconds(scanSettings?.timeout_seconds??3);
+        const response = await sendPageCommand(message.tabId, { type: 'observe-start-scan', account_timeout_seconds:accountTimeout }, () => scanStarts.get(message.tabId) === startId);
         if (!response?.ok || !response.started) throw new Error(response?.error || '页面未能启动扫描，请检查连接状态');
         return response;
       } catch (error) {
@@ -446,9 +452,11 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       if ((!observation?.enabled && !message.progress?.done) || !observation?.token) throw new Error('只读连接未配对或已停止');
       const accounts = Array.isArray(message.accounts) ? message.accounts : [];
       const progress = message.progress || null;
+      const previousStatus=(await chrome.storage.local.get('observation-status:'+sender.tab.id))['observation-status:'+sender.tab.id];
+      const displayProgress=progress || (previousStatus?.progress?.done ? previousStatus.progress : null);
       await chrome.storage.local.set({
         [observationKey]: { ...observation, accounts },
-        ['observation-status:' + sender.tab.id]: { time: new Date().toISOString(), phase: progress ? progress.done ? message.error ? 'error' : 'complete' : 'scanning' : message.error ? 'error' : 'observing', progress, error: message.error || '', count: accounts.length },
+        ['observation-status:' + sender.tab.id]: { time: new Date().toISOString(), phase: progress ? progress.done ? message.error ? 'error' : 'complete' : 'scanning' : message.error ? 'error' : 'observing', progress:displayProgress, error: message.error || '', count: accounts.length },
       });
       if (progress?.done && progress.restored !== true) {
         const latest = await chrome.storage.local.get(observationKey);

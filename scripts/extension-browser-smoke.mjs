@@ -246,6 +246,11 @@ try {
   await until(() => popup.evaluate(`typeof chrome !== 'undefined' && typeof chrome.runtime?.sendMessage === 'function'`), 'actual extension page');
   const tabId = await popup.evaluate(`(async()=>{const tabs=await chrome.tabs.query({url:'https://next.vestmarkets.com/trade/*'});return tabs[0]?.id;})()`);
   assert.equal(typeof tabId, 'number', 'actual browser tab ID');
+  await until(()=>popup.evaluate(`document.getElementById('scanTimeout')?.value==='3' && !document.getElementById('scanTimeout').disabled`),'default per-account scan timeout');
+  await popup.evaluate(`(()=>{const input=document.getElementById('scanTimeout');input.value='5';input.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+  await until(()=>popup.evaluate(`chrome.storage.local.get('account-scan-settings').then(s=>s['account-scan-settings']?.timeout_seconds===5)`),'scan timeout persisted');
+  await popup.command('Page.reload');
+  await until(()=>popup.evaluate(`document.getElementById('scanTimeout')?.value==='5' && !document.getElementById('scanTimeout').disabled`),'scan timeout restored after popup reload');
   const call = (message) => popup.evaluate(`chrome.runtime.sendMessage(${JSON.stringify(message)})`);
   const ping = await call({ type: 'page-command', tabId, message: { type: 'bridge-ping' } });
   assert.equal(ping.ok, true, 'normal actual runtime->background->tab connection');
@@ -273,6 +278,9 @@ try {
   assert.equal(completed.accounts.length, 3);
   assert.equal(completed.accounts.find((item) => item.name === 'QA Alpha').balance, 1000);
   assert.equal(completed.accounts.find((item) => item.name === 'QA Beta').balance, 1250);
+  assert.equal(completed.progress.account_timeout_seconds,5);
+  assert.equal(completed.progress.succeeded,3);assert.equal(completed.progress.failed,0);assert.equal(completed.progress.unread,0);
+  await until(()=>popup.evaluate(`document.getElementById('readProgress').textContent.includes('成功 3') && document.getElementById('readProgress').textContent.includes('失败 0')`),'exact scan completion counts');
   // Reproduce the reported switch failure: view the excluded main account and
   // remove every opening control. Enabling an idle permission must not prepare
   // this account, change the selection, poll a job or touch an order input.

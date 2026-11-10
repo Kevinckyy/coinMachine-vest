@@ -134,7 +134,17 @@ try {
   }
     return failureContinuation;
   };
-  if(process.env.VEST_SMOKE_LIVE_ONLY==='1'){
+  if(process.env.VEST_SMOKE_ACCOUNT_SCAN_ONLY==='1'){
+    await command('Page.navigate',{url:base+'/api/health'});
+    await until(()=>evaluate(`document.readyState==='complete' && location.pathname==='/api/health'`),'account timeout fixture');
+    const fixture=await readFile(path.join(root,'tests','account-scan-timeout-fixture.html'),'utf8');
+    await evaluate(`document.open();document.write(${JSON.stringify(fixture.replace(/<script>[\s\S]*?<\/script>/,''))});document.close();`);
+    await evaluate(fixture.match(/<script>([\s\S]*?)<\/script>/)[1]);
+    await evaluate(await readFile(path.join(root,'extension','core.js'),'utf8'));
+    await evaluate(await readFile(path.join(root,'extension','content.js'),'utf8'));
+    const result=await evaluate('runAccountScanTimeoutFixtureTests()',60000);
+    assert.equal(result.ok,true,JSON.stringify(result));console.log(JSON.stringify(result));
+  } else if(process.env.VEST_SMOKE_LIVE_ONLY==='1'){
     console.log(JSON.stringify(await runLiveDialogFixture()));
   } else if(process.env.VEST_SMOKE_STOP_RULE_ONLY==='1'){
     await command('Page.navigate',{url:base+'/api/health'});
@@ -187,14 +197,19 @@ try {
   await until(async () => (await (await fetch(base + '/api/state')).json()).accounts.some(a => a.name === 'QA 模拟账户'), 'create account via UI');
   await clickText('交易工作台', 'aside button');
   // Submit the visible bulk paper order form, then verify persisted positions.
+  // Daily quotas can exclude some seeded demo accounts; use the checked,
+  // enabled rows the user actually sees instead of assuming all eight qualify.
+  const selectedPaperNames=await evaluate(`Array.from(document.querySelectorAll('.account-table tbody input[type="checkbox"]:checked:not(:disabled)')).map(input=>input.getAttribute('aria-label').replace(/^选择 /,''))`);
+  assert.ok(selectedPaperNames.length>0,'at least one checked account can trade');
+  const paperHistoryBefore=(await(await fetch(base+'/api/state')).json()).history.length;
   await clickText('模拟买入 / 做多');
   await until(async () => (await (await fetch(base + '/api/state')).json()).positions.length > 0, 'bulk order via UI');
   const state = await (await fetch(base + '/api/state')).json();
-  assert.equal(state.positions.length, 8, 'all initially selected accounts received one paper position');
+  assert.deepEqual(state.positions.map(p=>p.account_name).sort(),selectedPaperNames.sort(),'all checked eligible accounts received exactly one paper position');
   await fetch(base + '/api/positions/close-all', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   const after = await (await fetch(base + '/api/state')).json();
   assert.equal(after.positions.length, 0, 'flatten paper positions');
-  assert.ok(after.history.length >= 120, 'paper fills persist to history');
+  assert.equal(after.history.length,paperHistoryBefore+selectedPaperNames.length,'each paper fill persists to history');
   // Real-account records are discovered automatically; the plugin mode is the only execution permission.
   await fetch(base + '/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'browser' }) });
   const pairing = await (await fetch(base + '/api/bridge/config')).json();
@@ -270,7 +285,8 @@ try {
   await until(() => evaluate(`[...document.querySelectorAll('.account-pool label')].some(label => label.textContent.includes('QA Observed Account') && !label.querySelector('input').disabled)`), 'auto-discovered execution account is available in strategy pool');
   await evaluate(`(() => { const input=document.querySelector('[aria-label="每批账户数量"]'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'1'); input.dispatchEvent(new Event('input',{bubbles:true})); })()`);
   await until(() => evaluate(`document.querySelector('#strategy-form button[type="submit"]')?.disabled === false`), 'execution mode permits starting a configured strategy without a binding wizard');
-  assert.equal(await evaluate(`document.querySelectorAll('.position-size-options button').length`),4,'strategy offers only the four Vest position-size presets');
+  assert.equal(await evaluate(`document.querySelectorAll('[aria-labelledby="strategy-size-label"] button').length`),4,'exam strategy offers the four Vest position-size presets');
+  assert.equal(await evaluate(`document.querySelectorAll('[aria-labelledby="live-size-label"] button').length`),4,'Live strategy has its independent four size presets');
   await evaluate(`document.querySelector('[aria-label="仓位大小 75%"]').click()`);
   assert.equal(await evaluate(`document.querySelector('[aria-label="仓位大小 75%"]').getAttribute('aria-pressed')`),'true','position size selection updates');
   assert.equal(await evaluate(`document.querySelector('#strategy-form')?.textContent.includes('每账户合约数量')`),false,'strategy quantity has been renamed to position size');

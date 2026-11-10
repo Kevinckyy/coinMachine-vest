@@ -32,6 +32,9 @@ function renderMode(next) {
   $('modeDescription').textContent = mode === 'execute' ? '工作台可向已识别的账户下单或运行策略；账户和页面状态会自动校验。' : '只同步账户信息；工作台不能向此页面发送交易操作。';
   $('readAccounts').disabled = scanActive || mode === 'execute';
   $('modeSwitch').disabled = scanActive || !initialized;
+  $('scanTimeout').disabled = scanActive || !initialized;
+  $('stopReadAccounts').hidden = !scanActive;
+  $('stopReadAccounts').disabled = preparationOnly || observationStatus?.phase==='stopping';
   if (preparationOnly) {
     $('modeSwitch').disabled = true; $('readAccounts').disabled = true;
     $('modeBadge').textContent = '已停用';
@@ -42,12 +45,14 @@ function showObservation(status) {
   if (!status) return;
   observationStatus = status;
   const progress = status.progress;
-  scanActive = status.phase === 'connecting' || status.phase === 'scanning' || !!(progress && !progress.done);
+  scanActive = ['connecting','scanning','stopping'].includes(status.phase) || !!(progress && !progress.done);
   $('accountCount').textContent = `${status.count || 0} 个账户`;
-  let text = status.phase === 'connecting' ? '正在连接页面…' : scanActive ? progress?.total ? `正在读取 ${Math.min(progress.completed + 1, progress.total)} / ${progress.total}：${progress.name || '账户'}` : '正在读取账户列表…' : `已读取 ${status.count || 0} 个账户，结果显示在工作台。`;
+  const counts=progress && typeof progress.succeeded==='number' ? `成功 ${progress.succeeded} · 失败 ${progress.failed||0} · 未读 ${progress.unread||0}` : '';
+  let text = status.phase === 'connecting' ? '正在连接页面…' : progress?.restoring && !progress.done ? `正在恢复原账户 · ${counts}` : scanActive ? progress?.total ? `正在读取 ${progress.index||Math.min(progress.completed+1,progress.total)} / ${progress.total}：${progress.name||'账户'}${counts?' · '+counts:''}` : '正在读取账户列表…' : counts ? `扫描结束：${counts}。详情显示在工作台。` : `已发现 ${status.count||0} 个账户，读取详情见工作台。`;
   if (status.error) text += ' ' + status.error;
+  if (status.phase==='stopping') text=`正在停止读取并恢复原账户${counts?' · '+counts:''}`;
   $('readProgress').textContent = text;
-  $('readProgress').className = status.error ? 'hint error' : 'hint';
+  $('readProgress').className = status.error || progress?.failed ? 'hint error' : 'hint';
   renderMode(mode);
 }
 function summary(accounts) {
@@ -67,7 +72,8 @@ async function init() {
   const statusKey = 'observation-status:' + tab.id;
   const modeKey = 'control-mode:' + tab.id;
   const errorKey = 'execution-error:' + tab.id;
-  const saved = await chrome.storage.local.get([observationKey, statusKey, errorKey]);
+  const saved = await chrome.storage.local.get([observationKey, statusKey, errorKey,'account-scan-settings']);
+  try {$('scanTimeout').value=VestBridgeCore.accountScanTimeoutSeconds(saved['account-scan-settings']?.timeout_seconds??3);} catch {$('scanTimeout').value=3;}
   renderExecutionError(saved[errorKey]);
   $('token').value = saved[observationKey]?.token || '';
   summary(saved[observationKey]?.accounts);
@@ -78,7 +84,19 @@ async function init() {
     if (area === 'local' && changes[statusKey]) showObservation(changes[statusKey].newValue);
     if (area === 'local' && changes[observationKey]) summary(changes[observationKey].newValue?.accounts);
     if (area === 'local' && changes[errorKey]) renderExecutionError(changes[errorKey].newValue);
+    if (area === 'local' && changes['account-scan-settings'] && !scanActive) {
+      try {$('scanTimeout').value=VestBridgeCore.accountScanTimeoutSeconds(changes['account-scan-settings'].newValue?.timeout_seconds??3);} catch {}
+    }
   });
+  const saveScanTimeout=async()=>{
+    const seconds=VestBridgeCore.accountScanTimeoutSeconds(Number($('scanTimeout').value));
+    await chrome.storage.local.set({'account-scan-settings':{timeout_seconds:seconds}});
+    $('scanSettingStatus').textContent=`已保存：每账号 ${seconds} 秒`; $('scanSettingStatus').className='hint';
+    return seconds;
+  };
+  $('scanTimeout').addEventListener('change',()=>{void saveScanTimeout().catch(error=>{
+    $('scanSettingStatus').textContent=error.message; $('scanSettingStatus').className='hint error';
+  });});
   $('modeSwitch').addEventListener('change', async () => {
     const requestId = ++modeRequest;
     const requested = $('modeSwitch').checked ? 'execute' : 'readonly';
@@ -100,12 +118,19 @@ async function init() {
       const token = $('token').value.trim();
       if (!token) throw new Error('请先粘贴工作台的本地配对码');
       if (mode === 'execute') throw new Error('请先切回只读再刷新完整账户列表');
+      await saveScanTimeout();
       scanActive = true; renderMode(mode);
       $('readProgress').textContent = '正在连接页面并读取账户…';
       const result = await background({ type: 'observe-start', tabId: tab.id, token });
       if (!result?.started) throw new Error('未能启动读取，请检测页面连接');
       show('账户正在后台读取。完成后自动出现在工作台，无需新增或绑定账户。');
     } catch (error) { scanActive = false; renderMode(mode); $('readProgress').textContent = error.message; $('readProgress').className = 'hint error'; show(error.message, true); }
+  });
+  $('stopReadAccounts').addEventListener('click',async()=>{
+    try {
+      await background({type:'observe-stop',tabId:tab.id});
+      show('已请求停止读取，正在结束当前读取并恢复原账户。');
+    } catch(error){show(error.message,true);}
   });
   $('connectPage').addEventListener('click', async () => {
     $('connectPage').disabled = true;
@@ -114,8 +139,9 @@ async function init() {
     finally { $('connectPage').disabled = false; }
   });
   setInterval(() => {
-    if (scanActive && observationStatus?.time && Date.now() - Date.parse(observationStatus.time) > 65000) {
-      scanActive = false; renderMode(mode); $('readProgress').textContent = '读取进度超时，请检查页面后重新读取。'; $('readProgress').className = 'hint error';
+    if (scanActive && observationStatus?.time && Date.now() - Date.parse(observationStatus.time) > VestBridgeCore.accountScanIdleTimeoutMs(observationStatus.progress)) {
+      $('readProgress').textContent = '长时间未收到读取进度；可停止读取后检查页面连接。'; $('readProgress').className = 'hint error';
+      $('stopReadAccounts').disabled=false;
     }
   }, 1000);
   initialized = true;

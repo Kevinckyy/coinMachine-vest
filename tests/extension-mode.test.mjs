@@ -95,6 +95,7 @@ function createHarness(options = {}) {
       return defaultFetch(String(url), init, body);
     },
   };
+  sandbox.importScripts = file => { if(file !== 'core.js') throw new Error('Unexpected worker script'); vm.runInContext(fs.readFileSync(new URL('../extension/core.js', import.meta.url), 'utf8'),sandbox); };
   vm.createContext(sandbox);
   vm.runInContext(source, sandbox, { filename: 'extension/background.js' });
   const dispatch = (message, sender = popupSender) => new Promise((resolve, reject) => {

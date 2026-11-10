@@ -1,7 +1,7 @@
 /* Operates only the public webpage DOM; never reads the website's credentials. */
 (() => {
   'use strict';
-  const VERSION = '0.3.20';
+  const VERSION = '0.3.21';
   const CONTROLLER = '__vestControlBridgeController';
   // A previous injection may belong to a reloaded extension context. Retire it
   // instead of trusting a boolean marker that can outlive its message listener.
@@ -17,6 +17,7 @@
   let lastDiagnostic = '';
   let observationEnabled = false;
   let observedAccounts = [];
+  let scanRunning = false;
   let lastObservationPoll = 0;
   let executionMode = 'readonly';
   let executionEpoch = 0;
@@ -625,49 +626,62 @@
       return { element, name, category, phase:core.accountPhase(labels) };
     });
   }
-  async function observerOpenSelector() {
+  async function observerOpenSelector(guard = () => {}, outerDeadline = Infinity) {
+    guard();
+    const pause=ms=>delay(Math.min(ms,Math.max(0,outerDeadline-Date.now())));
     observerAssertPage();
     if (observerItems().length) return observerItems();
     const trigger = observerTrigger();
     trigger.focus();
     // Radix opens on keyboard or pointerdown rather than a synthetic click.
     trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', code: 'ArrowDown', bubbles: true }));
-    await delay(180);
+    await pause(180);
+    guard();
     if (!observerItems().length) {
       trigger.dispatchEvent(new PointerEvent('pointerdown', { pointerType: 'mouse', isPrimary: true, button: 0, bubbles: true }));
       trigger.dispatchEvent(new PointerEvent('pointerup', { pointerType: 'mouse', isPrimary: true, button: 0, bubbles: true }));
-      await delay(180);
+      await pause(180);
+      guard();
     }
     if (!observerItems().length && trigger.getAttribute('aria-expanded') !== 'true') trigger.click();
-    const deadline = Date.now() + 4500;
+    const deadline = Number.isFinite(outerDeadline)?outerDeadline:Date.now()+4500;
     while (Date.now() < deadline) {
+      guard();
       observerAssertPage();
       const items = observerItems();
       if (items.length) return items;
-      await delay(150);
+      await pause(150);
     }
+    guard();
     throw new Error('未找到可见账户下拉列表，请确认页面已登录且为桌面布局');
   }
-  async function observerCloseSelector() {
+  async function observerCloseSelector(guard = () => {}, outerDeadline = Infinity) {
+    guard();
+    const pause=ms=>delay(Math.min(ms,Math.max(0,outerDeadline-Date.now())));
     if (!observerItems().length) return;
     const menu = queryOne('[data-slot="dropdown-menu-content"]') || queryOne('[role="menu"]');
     (menu || observerTrigger()).dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
-    await delay(120);
+    await pause(120);
+    guard();
     if (observerItems().length) {
       const trigger = observerTrigger();
       trigger.dispatchEvent(new PointerEvent('pointerdown', { pointerType: 'mouse', isPrimary: true, button: 0, bubbles: true }));
       trigger.dispatchEvent(new PointerEvent('pointerup', { pointerType: 'mouse', isPrimary: true, button: 0, bubbles: true }));
-      await delay(120);
+      await pause(120);
+      guard();
       if (observerItems().length && trigger.getAttribute('aria-expanded') === 'true') trigger.click();
     }
   }
-  async function observerWaitStable(name, minimumDelay = 1000, { monitoring = false, samples = 3 } = {}) {
-    await delay(minimumDelay);
+  async function observerWaitStable(name, minimumDelay = 1000, { monitoring = false, samples = 3, deadline: outerDeadline = Infinity, sampleInterval = 250, guard = () => {} } = {}) {
+    guard();
+    await delay(Math.min(minimumDelay,Math.max(0,outerDeadline-Date.now())));
+    guard();
     let previous = null;
     let matches = 0;
     let error = '账户资金读数未稳定';
-    const deadline = Date.now() + 4000;
+    const deadline = Number.isFinite(outerDeadline)?outerDeadline:Date.now()+4000;
     while (Date.now() < deadline) {
+      guard();
       try {
         const value = observerValues(name);
         const loadingFields=monitoring ? '[data-testid="account-value"],[data-testid="account-upnl"]' : '[data-testid="account-value"],[data-testid="account-upnl"],[data-testid^="capital-indicator-"],div.sticky.top-14[aria-busy="true"],div.sticky.top-14 [aria-busy="true"],div.sticky.top-14[data-loading="true"],div.sticky.top-14 [data-loading="true"]';
@@ -684,17 +698,18 @@
         previous = { identity, balance: value.balance, metrics };
         if (matches >= samples) return value;
       } catch (caught) { error = caught.message; matches = 0; previous = null; }
-      await delay(250);
+      await delay(Math.min(sampleInterval,Math.max(0,deadline-Date.now())));
     }
+    guard();
     const pending=new Error(error);
     pending.code='OBSERVATION_PENDING';
     throw pending;
   }
-  async function observerSelect(account, guard = () => {}) {
+  async function observerSelect(account, guard = () => {}, outerDeadline = Infinity) {
     guard();
     if (!observationEnabled) throw new Error('账户读取已停止');
     observerAssertPage();
-    const items = await observerOpenSelector();
+    const items = await observerOpenSelector(guard,outerDeadline);
     guard();
     for (const item of items) {
       if (items.filter(other => other.name === item.name).length === 1) {
@@ -709,16 +724,18 @@
     const selected = matchingName;
     account.category = selected[0].category;
     account.identity = selected[0].category + ':' + account.name;
-    if (observerIdentity().name === account.name) { await observerCloseSelector(); return; }
+    if (observerIdentity().name === account.name) { await observerCloseSelector(guard,outerDeadline); return; }
     observerAssertPage();
+    guard();
     selected[0].element.click();
-    const deadline = Date.now() + 3000;
+    const deadline = Number.isFinite(outerDeadline)?outerDeadline:Date.now()+3000;
     while (Date.now() < deadline) {
       guard();
       observerAssertPage();
       if (observerIdentity().name === account.name && !observerItems().length) return;
-      await delay(150);
+      await delay(Math.min(150,Math.max(0,deadline-Date.now())));
     }
+    guard();
     throw new Error('无法确认已选择正确账户；已停止扫描');
   }
   async function observerPublish(error = '', progress = null) {
@@ -761,17 +778,29 @@
     if(account.phase!==phase)Object.assign(account,{balance:null,equity:null,unrealized_pnl:null,observed_at:null,capital_metrics:{},phase_snapshot:null});
     Object.assign(account,{phase,phase_observed_at:Date.now()/1000});
   }
-  async function discoverAccounts() {
+  async function discoverAccounts({account_timeout_seconds=3,scan_id=null} = {}) {
     assertLive();
     if (busy) throw new Error('正在处理交易或读取任务，请等待完成');
+    const timeout=core.accountScanTimeoutSeconds(account_timeout_seconds);
+    scanRunning=true;
     busy = true;
     observationEnabled = true;
     if (config) config.armed = false;
-    const deadline = Date.now() + 45000;
     let original = null;
     let originalItem = null;
     let overallError = '';
     let restored = false;
+    const progress=(name='',extra={})=>{
+      const succeeded=observedAccounts.filter(a=>a.scan_status==='success').length;
+      const failed=observedAccounts.filter(a=>a.scan_status==='failed').length;
+      return {scan_id,account_timeout_seconds:timeout,completed:succeeded+failed,total:observedAccounts.length,
+        succeeded,failed,unread:observedAccounts.length-succeeded-failed,name,...extra};
+    };
+    const readGuard=deadline=>()=>{
+      assertLive();
+      if (!observationEnabled) {const error=new Error('账户读取已停止');error.code='SCAN_STOPPED';throw error;}
+      if (Date.now()>=deadline) {const error=new Error(`单账号读取超时（${timeout} 秒），已跳过`);error.code='ACCOUNT_SCAN_TIMEOUT';throw error;}
+    };
     try {
       observerAssertPage();
       original = observerIdentity();
@@ -785,37 +814,52 @@
       observedAccounts = items.map(({ name, category, phase }) => ({ name, category,...(phase?{phase,phase_observed_at:Date.now()/1000}:{}),
         identity: category + ':' + name, platform_id: null,
         equity: null, balance: null, unrealized_pnl: null, current: false, observed_at: null,
+        scan_status:counts.get(name)>1?'failed':'pending',
         read_error: counts.get(name) > 1 ? '账户名称重复，无法可靠区分；未切换读取' : '等待读取' }));
       await observerCloseSelector();
-      await observerPublish('', { completed: 0, total: observedAccounts.length, name: '' });
+      await observerPublish('', progress());
       if (!originalItem) throw new Error('当前账户名称不唯一，保留账户列表但不切换读取余额');
       for (let index = 0; index < observedAccounts.length; index++) {
         const account = observedAccounts[index];
         if (!observationEnabled) { overallError = '账户读取已停止'; break; }
-        if (Date.now() > deadline) { overallError = '已到扫描时间上限，其余账户尚未读取'; break; }
         if (counts.get(account.name) > 1) continue;
-        await observerPublish('', { completed: index, total: observedAccounts.length, name: account.name });
+        account.scan_status='reading';
+        await observerPublish('', progress(account.name,{index:index+1}));
+        const deadline=Date.now()+timeout*1000,guard=readGuard(deadline);
         try {
-          await observerSelect(account);
-          const value = await observerWaitStable(account.name);
+          await observerSelect(account,guard,deadline);
+          const value = await observerWaitStable(account.name,200,{deadline,sampleInterval:100,guard});
+          guard();
           Object.assign(account, value);
+          account.scan_status='success';
         } catch (caught) {
+          if (caught.code==='SCAN_STOPPED') {account.scan_status='pending';overallError=caught.message;break;}
+          account.scan_status='failed';
           account.read_error = caught.message;
-          if (observerIdentity().name === account.name) account.capital_metrics = observerCapitalMetrics();
-          if (observerIdentity().name !== account.name || [...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].some(visible)) {
+          let currentName=null;
+          try {currentName=observerIdentity().name;} catch {}
+          if (currentName===account.name) {try {account.capital_metrics=observerCapitalMetrics();} catch {}}
+          const modal=[...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].some(visible);
+          if (modal || (caught.code!=='ACCOUNT_SCAN_TIMEOUT' && currentName!==account.name)) {
             overallError = caught.message;
             break;
           }
+          // A timed-out account leaves no detached read/select promise behind.
+          // Close only its account menu, then verify the next target afresh.
+          if (caught.code==='ACCOUNT_SCAN_TIMEOUT') await observerCloseSelector(()=>assertLive());
         }
+        await observerPublish('',progress());
       }
     } catch (caught) { overallError = caught.message; }
     finally {
       if (!disposed && original && originalItem) {
         try {
+          try {await observerPublish(overallError,progress('',{restoring:true}));} catch { /* Restore the viewing account even if the local service is offline. */ }
           // Restore the original viewing account even if the user stopped a long scan.
           const enabled = observationEnabled;
           observationEnabled = true;
-          try { await observerSelect(originalItem); await observerWaitStable(originalItem.name, 300); }
+          const deadline=Date.now()+timeout*1000,guard=readGuard(deadline);
+          try { await observerSelect(originalItem,guard,deadline); await observerWaitStable(originalItem.name,200,{deadline,sampleInterval:100,guard}); }
           finally { observationEnabled = enabled; }
           restored = observerIdentity().signature === original.signature;
           if (!restored) throw new Error('账户名称已恢复，但状态标识变化，请人工核对');
@@ -829,10 +873,11 @@
       }
       if (!restored) observationEnabled = false;
       busy = false;
-      try { if (!disposed) await observerPublish(overallError, { completed: observedAccounts.filter((account) => account.observed_at !== null).length, total: observedAccounts.length, done: true, restored }); }
+      try { if (!disposed) await observerPublish(overallError,progress('',{done:true,restored})); }
       catch (caught) { overallError = [overallError, '同步失败：' + caught.message].filter(Boolean).join('；'); }
+      scanRunning=false;
     }
-    return { accounts: observedAccounts, error: overallError, restored };
+    return { accounts: observedAccounts, error: overallError, restored, ...progress() };
   }
   async function observationTick() {
     if (disposed || busy || !observationEnabled || Date.now() - lastObservationPoll < 2000) return;
@@ -1427,8 +1472,10 @@
       const scanId = globalThis.crypto?.randomUUID?.() || String(Date.now());
       // Acknowledge independently of the popup lifetime; progress is persisted
       // through background messages and survives closing/reopening the popup.
-      const scanning = discoverAccounts();
-      respond({ ok: true, started: true, scan_id: scanId });
+      let timeout;
+      try {timeout=core.accountScanTimeoutSeconds(message.account_timeout_seconds??3);} catch(error) {respond({ok:false,error:error.message});return;}
+      const scanning = discoverAccounts({account_timeout_seconds:timeout,scan_id:scanId});
+      respond({ ok: true, started: true, scan_id: scanId, account_timeout_seconds:timeout });
       scanning.catch(async (error) => {
         observationEnabled = false;
         try { if (!disposed) await observerPublish(error.message, { completed: 0, total: observedAccounts.length, done: true, restored: false }); } catch {}
@@ -1436,10 +1483,10 @@
       return;
     }
     if (message.type === 'observe-accounts') {
-      discoverAccounts().then((result) => respond({ ok: true, ...result })).catch((error) => respond({ ok: false, error: error.message }));
+      discoverAccounts({account_timeout_seconds:message.account_timeout_seconds??3}).then((result) => respond({ ok: true, ...result })).catch((error) => respond({ ok: false, error: error.message }));
       return true;
     }
-    if (message.type === 'observation-stop') { observationEnabled = false; respond({ ok: true }); return; }
+    if (message.type === 'observation-stop') { observationEnabled = false; respond({ ok: true, scan_running:scanRunning }); return; }
     if (message.type === 'observe-current') {
       try { respond({ ok: true, snapshot: observerValues(),execution_costs:orderExecutionCosts() }); }
       catch (error) { respond({ ok: false, error: error.message }); }
