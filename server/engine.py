@@ -33,7 +33,8 @@ STRATEGY_FORM_DEFAULTS = dict(strategy_id='random_entry',batch_size=2, order_del
     skip_stop_loss_on_low_drawdown=False, drawdown_stop_loss_threshold=200,
     live_default_locked=True, live_side='random', live_size_percent=25,
     live_take_profit=None, live_stop_loss=130,
-    live_skip_stop_loss_on_low_drawdown=False, live_drawdown_stop_loss_threshold=200)
+    live_skip_stop_loss_on_low_drawdown=False, live_drawdown_stop_loss_threshold=200,
+    live_payout_recipient='main',live_payout_mode='all',live_payout_amount=1,live_payout_percent=100)
 
 class ValidationError(ValueError):
     def __init__(self, message, status=400):
@@ -744,6 +745,14 @@ class Engine(PhaseAccounting):
                 policy[key]=None if value is None else positive(value,label)
             if policy['live_skip_stop_loss_on_low_drawdown'] and policy['live_stop_loss'] is None:
                 raise ValidationError('Live 低回撤止损规则需要先填写止损金额')
+            recipient=body.get('live_payout_recipient','main')
+            if recipient!='main':raise ValidationError('Live 利润收款人必须为主账户')
+            payout_mode=body.get('live_payout_mode','all')
+            if payout_mode not in ('all','amount','percent'):raise ValidationError('Live 利润领取方式无效')
+            payout_amount=positive(body.get('live_payout_amount',1),'Live 利润领取金额')
+            if round(payout_amount,6)!=payout_amount:raise ValidationError('Live 利润领取金额最多支持 6 位小数')
+            policy.update(live_payout_recipient=recipient,live_payout_mode=payout_mode,live_payout_amount=payout_amount,
+                live_payout_percent=positive(body.get('live_payout_percent',100),'Live 利润领取比例',100))
         return {'symbol': 'NQ-PERP', 'side': side, **sizing, **policy,
                 'take_profit': positive(body['take_profit'], '止盈金额') if body.get('take_profit') is not None else None,
                 'stop_loss': positive(body.get('stop_loss',130), '止损金额')}

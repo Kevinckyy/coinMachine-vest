@@ -996,10 +996,13 @@ class HTTPTests(unittest.TestCase):
 
     def test_strategy_form_http_persists_without_starting_and_rejects_extension_origin(self):
         headers={'Content-Type':'application/json'}
-        body=dict(stop_loss=177,skip_stop_loss_on_low_drawdown=True,drawdown_stop_loss_threshold=222)
+        body=dict(stop_loss=177,skip_stop_loss_on_low_drawdown=True,drawdown_stop_loss_threshold=222,
+                  live_payout_recipient='main',live_payout_mode='percent',live_payout_percent=37.5)
         status,_,raw=self.request('POST','/api/strategy/config',body,headers)
         self.assertEqual(status,200)
         self.assertEqual(json.loads(raw)['drawdown_stop_loss_threshold'],222)
+        self.assertEqual(json.loads(raw)['live_payout_recipient'],'main')
+        self.assertEqual(json.loads(raw)['live_payout_percent'],37.5)
         self.assertEqual(json.loads(self.request('GET','/api/state')[2])['preferences']['strategy_config']['stop_loss'],177)
         self.assertEqual(self.request('POST','/api/strategy/config',{'drawdown_stop_loss_threshold':0},headers)[0],400)
         extension={**headers,'Origin':'chrome-extension://'+'a'*32,'X-Bridge-Token':self.engine.bridge_token}

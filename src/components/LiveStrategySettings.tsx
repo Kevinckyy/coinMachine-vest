@@ -6,12 +6,17 @@ export type LiveStrategyConfig = {
   live_stop_loss: number | null;
   live_skip_stop_loss_on_low_drawdown: boolean;
   live_drawdown_stop_loss_threshold: number;
+  live_payout_recipient: 'main';
+  live_payout_mode: 'all' | 'amount' | 'percent';
+  live_payout_amount: number;
+  live_payout_percent: number;
 };
 
 export const defaultLiveStrategyConfig: LiveStrategyConfig = {
   live_default_locked: true, live_side: 'random', live_size_percent: 25,
   live_take_profit: null, live_stop_loss: 130,
   live_skip_stop_loss_on_low_drawdown: false, live_drawdown_stop_loss_threshold: 200,
+  live_payout_recipient: 'main', live_payout_mode: 'all', live_payout_amount: 1, live_payout_percent: 100,
 };
 
 export default function LiveStrategySettings({value, onChange}: {
@@ -49,5 +54,23 @@ export default function LiveStrategySettings({value, onChange}: {
           onChange={e => onChange({live_drawdown_stop_loss_threshold:Number(e.target.value)})}/></label>
     </div>
     <p className="form-footnote">Live 参数独立于考核号，单号手动解锁后仍需选入策略。止盈或止损留空表示不设置；已有持仓沿用开仓时的参数。</p>
+    <div className="strategy-stop-rule live-payout-settings" aria-label="Live 利润领取参数">
+      <h3>利润领取</h3>
+      <label className="field"><span className="field-label">收款人</span>
+        <input aria-label="Live 利润收款人" value="主账户" readOnly/></label>
+      <label className="field"><span className="field-label">领取方式</span>
+        <select aria-label="Live 利润领取方式" value={value.live_payout_mode}
+          onChange={e=>onChange({live_payout_mode:e.target.value as LiveStrategyConfig['live_payout_mode']})}>
+          <option value="all">全部可领取利润</option><option value="amount">固定金额</option><option value="percent">按比例</option>
+        </select></label>
+      {value.live_payout_mode==='amount'&&<label className="field"><span className="field-label">申请金额 · USDC</span>
+        <input aria-label="Live 利润领取金额" type="number" min="0.000001" step="0.000001" required value={value.live_payout_amount}
+          onChange={e=>onChange({live_payout_amount:Number(e.target.value)})}/></label>}
+      {value.live_payout_mode==='percent'&&<label className="field"><span className="field-label">领取比例 · %</span>
+        <input aria-label="Live 利润领取比例" type="number" min="0.000001" max="100" step="any" required value={value.live_payout_percent}
+          onChange={e=>onChange({live_payout_percent:Number(e.target.value)})}/></label>}
+      <p className="form-footnote">默认领取全部可领取利润到主账户。金额和比例均按分润前的可领取利润计算，实际到账以 Vest 弹窗预览为准。</p>
+      <p className="form-footnote">当前仅保存领取参数，不会自动提交利润领取申请。</p>
+    </div>
   </section>;
 }

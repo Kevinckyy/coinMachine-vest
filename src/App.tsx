@@ -128,7 +128,7 @@ export default function App() {
   useEffect(() => {
     if (!data || strategyInitialized.current) return;
     const saved = data.preferences?.strategy_config;
-    if (!saved || saved.live_default_locked === undefined || saved.live_stop_loss === undefined) {
+    if (!saved || saved.live_default_locked === undefined || saved.live_stop_loss === undefined || saved.live_payout_recipient === undefined || saved.live_payout_mode === undefined) {
       setStrategySave({status:'upgrade',error:''});
       return;
     }
