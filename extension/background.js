@@ -14,6 +14,7 @@ const PREPARATION_HASH = '#vest-preparation=';
 const modeStorage = chrome.storage.session || {
   async get(key) { return { [key]: volatileModes[key] }; },
   async set(values) { Object.assign(volatileModes, values); },
+  async remove(key) { delete volatileModes[key]; },
 };
 const PAGE_COMMANDS = new Set(['bridge-ping', 'configure', 'capture', 'inspect', 'pick', 'prepare', 'observe-current']);
 
@@ -639,6 +640,9 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  // Invalidate in-flight mode changes and release the per-tab identity even
+  // when the user closes the tab while an HTTP request is outstanding.
+  controlChanges.delete(tabId);
   (async () => {
     const role = await preparationRole(tabId, '');
     if (role && !role.orphan) {

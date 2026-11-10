@@ -456,3 +456,17 @@ test('a truncated successful HTTP response holds execution but malformed JSON st
   assert.equal((await h.dispatch({type:'mode-heartbeat'},pageSender)).ok,false);
   assert.equal((await h.dispatch({type:'control-status',tabId:42})).data.mode,'readonly');
 });
+
+test('closed tabs release execution control records instead of retaining one entry per tab forever',async t=>{
+  const h=harness(t);
+  for(let id=100;id<130;id++){
+    h.state.local['observation:'+id]={enabled:true,token:PAIRING,accounts:clone(observed)};
+    assert.equal((await h.dispatch({type:'control-mode',tabId:id,token:PAIRING,mode:'execute'})).ok,true);
+    h.state.onRemoved(id);
+    for(let i=0;i<20&&h.state.local['observation:'+id];i++)await flush();
+    assert.equal(h.state.local['observation:'+id],undefined);
+    assert.equal(h.state.session['control-mode:'+id],undefined);
+    assert.equal(h.state.session['connection-health:'+id],undefined);
+  }
+  assert.equal(vm.runInContext('controlChanges.size',h.sandbox),0,'closed-tab control identifiers must be collectible');
+});

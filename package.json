@@ -13,6 +13,7 @@
     "test": "python -m unittest discover -s tests -v",
     "test:extension": "node --test tests/extension.test.mjs tests/extension-connection.test.mjs tests/extension-mode.test.mjs",
     "test:extension:browser": "node scripts/extension-browser-smoke.mjs",
+    "test:extension:memory": "node scripts/extension-memory-smoke.mjs",
     "test:browser": "node scripts/browser-smoke.mjs",
     "test:strategy:browser": "node scripts/strategy-browser-smoke.mjs",
     "test:terminal:browser": "node scripts/terminal-browser-smoke.mjs",

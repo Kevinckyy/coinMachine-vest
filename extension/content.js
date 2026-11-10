@@ -1,7 +1,7 @@
 /* Operates only the public webpage DOM; never reads the website's credentials. */
 (() => {
   'use strict';
-  const VERSION = '0.3.22';
+  const VERSION = '0.3.23';
   const CONTROLLER = '__vestControlBridgeController';
   // A previous injection may belong to a reloaded extension context. Retire it
   // instead of trusting a boolean marker that can outlive its message listener.
@@ -30,7 +30,9 @@
   let lastModeHeartbeat = 0;
   let bootReady = false;
   let phaseAdvance = null;
-  let terminalDismissal = null;
+  // A dismissed React dialog can retain its old component tree. Keep only weak
+  // DOM keys while still suppressing duplicate clicks on a persistent notice.
+  let terminalDismissals = new WeakMap();
   let lastCostObservation = 0;
   let preparationOnly = location.hash.startsWith('#vest-preparation=');
   let preparationGuardInstalled = false;
@@ -496,6 +498,7 @@
       if (/context invalidated|Extension context|Receiving end/i.test(error.message)) dispose();
       throw error;
     }
+    assertLive(); // A retired actor must not refill caches after an awaited IPC.
     if (!result?.ok) throw Object.assign(new Error(result?.error || '本地桥接无响应'), {code:result?.code});
     return result.data;
   }
@@ -1162,11 +1165,12 @@
       if (!await reportCurrentTerminal(identity.name)) return true;
       assertExecution(epoch);
     }
-    if (!modal) { terminalDismissal=null; return !acknowledged; }
+    if (!modal) return !acknowledged;
     assertExecution(epoch);
     const fresh=terminalAccountDialog();
     if (!fresh || fresh.dialog!==modal.dialog || fresh.identity.signature!==identity.signature) return true;
-    if (terminalDismissal?.epoch===epoch && terminalDismissal.name===identity.name && terminalDismissal.dialog===fresh.dialog) {
+    const dismissed = terminalDismissals.get(fresh.dialog);
+    if (dismissed?.epoch===epoch && dismissed.name===identity.name) {
       lastDiagnostic=identity.name+' 关闭提示尚未消失，等待读取；不重复点击';
       return true;
     }
@@ -1174,7 +1178,7 @@
     if (fresh.button.disabled || fresh.button.getAttribute('aria-disabled')==='true' || fresh.button.getAttribute('aria-busy')==='true') return true;
     // Archive acknowledgement precedes this informational Close. Paid retry,
     // account purchases, order confirmations and historical links are untouched.
-    terminalDismissal={epoch,dialog:fresh.dialog,name:identity.name};
+    terminalDismissals.set(fresh.dialog,{epoch,name:identity.name});
     click(fresh.button);
     lastDiagnostic=identity.name+' 已确认关闭并归档，已关闭亏损上限提示，等待切换下一账户';
     return true;
@@ -1240,6 +1244,7 @@
     if (connectionBlocked) lastDiagnostic = '本地连接暂时中断，暂停操作等待恢复：' + (reply.connection_error || '');
   }
   function acceptSession(reply) {
+    if (disposed) return;
     if (reply?.stale_response) return;
     if (reply?.mode_epoch !== undefined && reply.mode_epoch < executionEpoch) return;
     acceptConnection(reply);
@@ -1431,7 +1436,7 @@
     for (const name of ['pointerdown', 'pointerup', 'mousedown', 'mouseup']) document.addEventListener(name, blockPointer, true);
   }
   function messageHandler(message, _sender, respond) {
-    if (disposed) return;
+    if (disposed) { respond({ok:false,error:'页面控制器已停止'}); return; }
     if (!bootReady && message.type !== 'bridge-ping') { booted.then(() => messageHandler(message,_sender,respond)); return true; }
     if (message.type === 'bridge-ping') {
       const answer = () => respond({ ok: true, protocol: 4, version: VERSION, instance_id: instanceId, busy, reading: observationEnabled && busy });
@@ -1545,6 +1550,10 @@
     try { runtime.onMessage.removeListener(messageHandler); } catch {}
     try { chrome.storage.onChanged.removeListener(storageHandler); } catch {}
     for (const event of ['pointerdown','mousedown','click','submit','keydown']) document.removeEventListener(event,blockPreparationTrade,true);
+    // The public controller may remain on window after an extension reload.
+    // Release the retired actor's cached account data and weak-map metadata.
+    config = null; observedAccounts = []; sessionAccounts = [];
+    phaseAdvance = null; liveAdvance = null; terminalDismissals = new WeakMap();
   }
   const instanceId = globalThis.crypto?.randomUUID?.() || String(Date.now()) + Math.random();
   globalThis[CONTROLLER] = { version: VERSION, protocol: 4, instance_id: instanceId, dispose };
@@ -1553,6 +1562,7 @@
   // The popup sends a current tab-bound configuration; a reload requires reconnection.
   // Never silently reuse another tab's settings or arm a newly opened tab.
   runtime.sendMessage({ type: 'observation-restore' }).then((result) => {
+    if (disposed) return;
     if (result?.data?.preparation) { preparationOnly = true; protectPreparationWindow(); }
     if (preparationOnly) { preparationBanner('此功能已取消，请关闭此旧窗口'); return; }
     if (!disposed && result?.ok && result.data?.enabled) {

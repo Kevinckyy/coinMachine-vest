@@ -1,0 +1,79 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Isolated bridge memory regression</title></head><body>
+<button data-testid="account-selector-trigger"><span class="truncate">Alpha</span><span id="category">Closed</span></button>
+<p data-testid="account-value">****</p><p data-testid="account-upnl">****</p><p data-testid="book-mark">$100.00</p>
+<button data-testid="account-tab-active-positions" aria-selected="true" aria-controls="positions">Active Positions</button>
+<div id="positions"><p>No positions yet</p></div>
+<script>
+(() => {
+  const messages=new Set(), changes=new Set(), timers=new Map();
+  let nextTimer=0, epoch=0, retired=false, clock=Date.now(), route=false;
+  Date.now=()=>clock;
+  const counts={messages:0,polls:0,observations:0,dismissals:0};
+  const accounts=[{id:'alpha',name:'Alpha'},{id:'beta',name:'Beta'}].map(a=>({...a,category:'eval',
+    identity:'eval:'+a.name,mode:'browser',auto_discovered:true,balance:5000,equity:5000,unrealized_pnl:0}));
+  const registrations=()=>accounts.map(a=>a.id==='alpha'&&retired?{...a,category:'closed',retired_failed:true,archived:true}:a);
+  const reply=extra=>({ok:true,data:{mode:'execute',mode_epoch:epoch,accounts:registrations(),...extra}});
+  const event=set=>({addListener:fn=>set.add(fn),removeListener:fn=>set.delete(fn)});
+  globalThis.setInterval=callback=>{const id=++nextTimer;timers.set(id,callback);return id;};
+  globalThis.clearInterval=id=>timers.delete(id);
+  Object.defineProperty(globalThis,'chrome',{configurable:true,value:{runtime:{id:'isolated-memory-fixture',
+    onMessage:event(messages),sendMessage:async m=>{
+      counts.messages++;
+      if(m.type==='observation-restore')return {ok:true,data:{enabled:true,accounts:structuredClone(accounts),mode_epoch:0}};
+      if(m.type==='mode-heartbeat')return reply({});
+      if(m.type==='execution-next')return reply({next_account:route?{...accounts[1],operation:'monitor'}:null});
+      if(m.type==='observe'){
+        counts.observations++;
+        if(m.accounts.some(a=>a.name==='Alpha'&&a.category==='closed'))retired=true;
+        return reply({});
+      }
+      if(m.type==='poll'){counts.polls++;return reply({job:null});}
+      if(m.type==='execution-failed')throw new Error('Unexpected execution failure: '+m.error);
+      throw new Error('Fixture rejects message '+m.type);
+    }},storage:{local:{get:async()=>({}),set:async()=>{}},onChanged:event(changes)}}});
+  const send=message=>new Promise(resolve=>{
+    if(messages.size!==1)throw new Error('Expected exactly one active message listener');
+    [...messages][0](message,{},resolve);
+  });
+  const ready=async()=>{await send({type:'bridge-ping'});};
+  const enable=async()=>{
+    epoch++;await ready();
+    const result=await send({type:'control-mode',mode:'execute',mode_epoch:epoch,session_id:'isolated-memory',accounts:registrations()});
+    if(!result.ok)throw new Error(result.error);
+  };
+  const tick=async()=>{clock+=1000;for(const callback of timers.values())await callback();await Promise.resolve();};
+  function showClosure(payloadSize=0) {
+    retired=false;
+    document.querySelector('.truncate').textContent='Alpha';
+    document.getElementById('category').textContent='Closed';
+    document.querySelector('[data-testid="account-value"]').textContent='****';
+    document.querySelector('[data-testid="account-upnl"]').textContent='****';
+    const modal=document.createElement('div');modal.setAttribute('role','dialog');
+    modal.innerHTML='<div data-slot="dialog-header"><h2 data-slot="dialog-title">Your Drawdown Ran Out</h2><div>Your account has reached its Drawdown Limit and is now closed.</div></div><button>Close</button>';
+    // A payload represents objects reachable through a framework's DOM links.
+    // No fixture variable holds the element strongly after this function exits.
+    if(payloadSize)modal.memoryPayload=Array(payloadSize).fill(42);
+    modal.querySelector('button').onclick=()=>{
+      if(!retired)throw new Error('Notice dismissed before archive acknowledgement');
+      counts.dismissals++;modal.remove();
+    };
+    document.body.append(modal);
+    globalThis.memoryDialog=new WeakRef(modal);
+  }
+  async function dismiss(payloadSize=0) {
+    showClosure(payloadSize);await enable();await tick();
+    if(document.querySelector('[role="dialog"]'))throw new Error('Closure notice was not dismissed');
+    await send({type:'control-mode',mode:'readonly',mode_epoch:epoch+1});epoch++;
+    document.querySelector('.truncate').textContent='Beta';
+    document.getElementById('category').textContent='Evaluation';
+    document.querySelector('[data-testid="account-value"]').textContent='$5,000.00';
+    document.querySelector('[data-testid="account-upnl"]').textContent='$0.00';
+  }
+  globalThis.memoryFixture={ready,enable,tick,dismiss,
+    async runTicks(n,monitoring=false){route=monitoring;await enable();for(let i=0;i<n;i++)await tick();route=false;},
+    async closures(n){for(let i=0;i<n;i++)await dismiss(1024);},
+    stats(){return {...counts,listeners:messages.size,storageListeners:changes.size,timers:timers.size,
+      elements:document.querySelectorAll('*').length};},
+  };
+})();
+</script></body></html>
