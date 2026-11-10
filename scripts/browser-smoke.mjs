@@ -144,7 +144,7 @@ try {
       await evaluate(`document.open();document.write(${JSON.stringify(fixture.replace(/<script>[\s\S]*?<\/script>/,''))});document.close();`);
       await evaluate(`globalThis.profitClaimOptions=${JSON.stringify(options)}`);
       await evaluate(fixture.match(/<script>([\s\S]*?)<\/script>/)[1]);
-      for(const file of ['core.js','profit-claim.js','content.js'])await evaluate(await readFile(path.join(root,'extension',file),'utf8'));
+      for(const file of ['core.js','profit-claim.js','stop-protection.js','content.js'])await evaluate(await readFile(path.join(root,'extension',file),'utf8'));
       const result=await evaluate('runProfitClaimFixture()',30000);
       assert.equal(result.ok,true,JSON.stringify(result));results.push(result);
     }
@@ -164,15 +164,16 @@ try {
     assert.equal(result.ok,true,JSON.stringify(result));console.log(JSON.stringify(result));
   } else if(process.env.VEST_SMOKE_LIVE_ONLY==='1'){
     console.log(JSON.stringify(await runLiveDialogFixture()));
-  } else if(process.env.VEST_SMOKE_STOP_RULE_ONLY==='1'){
+  } else if((process.env.VEST_SMOKE_STOP_RULE_ONLY==='1'||process.env.VEST_SMOKE_STOP_CALIBRATION_ONLY==='1')){
     await command('Page.navigate',{url:base+'/api/health'});
     await until(()=>evaluate(`document.readyState==='complete' && location.pathname==='/api/health'`),'native protection fixture');
     const fixture=await readFile(path.join(root,'tests/bridge-fixture.html'),'utf8');
     await evaluate(`document.open(); document.write(${JSON.stringify(fixture.replace(/<script>[\s\S]*?<\/script>/,''))}); document.close();`);
     await evaluate(fixture.match(/<script>([\s\S]*?)<\/script>/)[1]);
     await evaluate(await readFile(path.join(root,'extension/core.js'),'utf8'));
+    await evaluate(await readFile(path.join(root,'extension/stop-protection.js'),'utf8'));
     await evaluate(await readFile(path.join(root,'extension/content.js'),'utf8'));
-    const stopRule=await evaluate('runStopRuleFixtureTests()',60000);
+    const stopRule=await evaluate(process.env.VEST_SMOKE_STOP_CALIBRATION_ONLY==='1'?'runStopCalibrationFixtureTests()':'runStopRuleFixtureTests()',60000);
     assert.equal(stopRule.failed,0,JSON.stringify(stopRule));
     console.log(JSON.stringify({ok:true,stopRule},null,2));
   } else if(process.env.VEST_SMOKE_FAILURE_ONLY==='1'){
@@ -471,11 +472,12 @@ try {
   await evaluate(`document.open(); document.write(${JSON.stringify(fixtureHtml)}); document.close();`);
   await evaluate(fixtureScript);
   await evaluate(await readFile(path.join(root, 'extension', 'core.js'), 'utf8'));
+  await evaluate(await readFile(path.join(root, 'extension', 'stop-protection.js'), 'utf8'));
   await evaluate(await readFile(path.join(root, 'extension', 'content.js'), 'utf8'));
   const bridge = await evaluate('runBridgeFixtureTests()',60000);
   assert.equal(bridge.failed, 0, 'all bridge DOM scenarios: ' + JSON.stringify(bridge));
   assert.equal(bridge.total, 22);
-  const stopRule=await evaluate('runStopRuleFixtureTests()',60000);
+  const stopRule=await evaluate(process.env.VEST_SMOKE_STOP_CALIBRATION_ONLY==='1'?'runStopCalibrationFixtureTests()':'runStopRuleFixtureTests()',60000);
   assert.equal(stopRule.failed,0,'conditional stop rule: '+JSON.stringify(stopRule));
   await command('Page.navigate', { url: base + '/api/health' });
   await until(() => evaluate(`document.readyState === 'complete' && location.pathname === '/api/health'`), 'account observation fixture page');
@@ -484,6 +486,7 @@ try {
   await evaluate(`document.open(); document.write(${JSON.stringify(observerFixture.replace(/<script>[\s\S]*?<\/script>/, ''))}); document.close();`);
   await evaluate(observerScript);
   await evaluate(await readFile(path.join(root, 'extension', 'core.js'), 'utf8'));
+  await evaluate(await readFile(path.join(root, 'extension', 'stop-protection.js'), 'utf8'));
   await evaluate(await readFile(path.join(root, 'extension', 'content.js'), 'utf8'));
   const accountObservation = await evaluate('runAccountObservationFixtureTests()', 60000);
   assert.equal(accountObservation.failed, 0, 'all independent account observation scenarios: ' + JSON.stringify(accountObservation));

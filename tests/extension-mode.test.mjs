@@ -520,3 +520,21 @@ test('verified payout balances replace stale observation rows before the next he
   assert.equal(last.accounts[0].balance,5000,'a heartbeat cannot restore the pre-withdrawal balance');
   assert.equal(last.accounts[0].phase_snapshot.balance,5000);
 });
+
+test('native stop intent is sent once with actual fill and is blocked after revocation',async t=>{
+  const h=harness(t);await mode(h,'execute');
+  const state=(await h.dispatch({type:'control-status',tabId:42})).data;
+  const snapshot={position_open:true,position_id:'fixture-fill',entry_price:20102,quantity:4,
+    side:'sell',symbol:'NQ-PERP',native_sl_price:20132.5,observed_at:Date.now()/1000};
+  const payload={type:'stop-protection',job_id:'fixture-job',account_id:automatic[0].id,
+    identity:automatic[0].identity,session_id:state.session_id,mode_epoch:state.mode_epoch,
+    snapshot,target_price:20134.5};
+  h.state.fetchHandler=r=>{if(r.url.endsWith('/api/bridge/stop-protection'))throw new TypeError('Lost stop amendment response');};
+  const reply=await h.dispatch(payload,pageSender);
+  assert.equal(reply.ok,false);assert.equal(reply.code,'LOCAL_SERVICE_UNAVAILABLE');
+  const requests=h.state.requests.filter(r=>r.url.endsWith('/api/bridge/stop-protection'));
+  assert.equal(requests.length,1);assert.deepEqual(requests[0].body.snapshot,snapshot);
+  h.state.fetchHandler=null;await mode(h,'readonly');
+  assert.equal((await h.dispatch(payload,pageSender)).ok,false);
+  assert.equal(h.state.requests.filter(r=>r.url.endsWith('/api/bridge/stop-protection')).length,1);
+});

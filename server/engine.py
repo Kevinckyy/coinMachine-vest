@@ -26,6 +26,7 @@ from .trading_day import trading_day_window,entry_day_window
 from .phases import PhaseAccounting, PHASES, phase_rank
 from .strategies import catalogue,require_strategy,choose_live_first,choose_batch_side
 from .profit_claims import ProfitClaims
+from .stop_protection import stop_plan
 
 NQ_TRADE_PATHS = {'/trade/NQ-PERP','/trade/NDX-USD-PERP'}
 STRATEGY_FORM_DEFAULTS = dict(strategy_id='random_entry',batch_size=2, order_delay_min=2, order_delay_max=8,
@@ -2026,6 +2027,49 @@ class Engine(PhaseAccounting, ProfitClaims):
             self._save()
             return {'ok':True,'job_id':job['id'],'quantity':quantity,'size_percent':job['size_percent'],**policy}
 
+    def bridge_stop_protection(self, body):
+        """Reserve one native amendment for a delivered, actually filled entry."""
+        with self.lock:
+            job=self.data['jobs'].get(body.get('job_id')) if isinstance(body.get('job_id'),str) else None
+            if not job or job['type']!='open' or job['status']!='delivered' or not 0<=self.clock()-job['delivered_at']<=90:
+                raise ValidationError('不存在可校正止损的已派发开仓任务',409)
+            account=self._account(job['account_id'])
+            if body.get('account_id')!=account['id']:
+                raise ValidationError('止损校正与任务账户不匹配',409)
+            self._assert_execution_allowed(account)
+            self._execution_identity(body,account)
+            if not self._execution_capable(account['id']) or job.get('session_id')!=body.get('session_id') or job.get('mode_epoch')!=body.get('mode_epoch'):
+                raise ValidationError('止损校正执行授权已失效',409)
+            parsed=urlparse(str(body.get('tab_url','')))
+            if parsed.scheme!='https' or parsed.hostname!='next.vestmarkets.com' or parsed.path.rstrip('/') not in NQ_TRADE_PATHS:
+                raise ValidationError('止损校正必须来自 Vest NQ 交易页面',403)
+            snap=self._snapshot(body.get('snapshot'))
+            if (snap.get('position_open') is not True or not snap.get('position_id') or
+                snap.get('symbol')!=job['symbol'] or snap.get('side')!=job['side'] or
+                number(job.get('quantity')) is None or number(snap.get('quantity')) is None or
+                not math.isclose(snap['quantity'],job['quantity'],rel_tol=1e-9,abs_tol=1e-9) or
+                abs(self.clock()-snap['observed_at'])>5 or snap['observed_at']<job['delivered_at'] or
+                job.get('phase')!=snap.get('phase')):
+                raise ValidationError('止损校正需要同账户、阶段和真实成交仓位的新鲜快照',409)
+            if job.get('stop_loss') is None:
+                raise ValidationError('本单配置不设止损，禁止添加止损',409)
+            try:plan=stop_plan(snap,job['stop_loss'])
+            except ValueError as exc:raise ValidationError(str(exc),409) from None
+            if not (snap.get('price') and (snap['price']>plan['target_price'] if snap['side']=='buy' else snap['price']<plan['target_price'])):
+                raise ValidationError('行情已越过目标止损价，禁止自动修改',409)
+            if number(body.get('target_price')) is None or not math.isclose(number(body['target_price']),plan['target_price'],abs_tol=1e-8,rel_tol=0):
+                raise ValidationError('止损触发价与真实成交风险计算不符',409)
+            if plan['status']=='verified':
+                return {'ok':True,'authorize_click':False,**plan}
+            # Existing intent is never another authorization, including after a
+            # lost reply or a service restart. Keep the fill receipt independent.
+            if job.get('stop_amendment'):
+                return {'ok':True,'authorize_click':False,'target_price':plan['target_price']}
+            job['stop_amendment']={**plan,'position_id':snap['position_id'],'entry_price':snap['entry_price'],
+                'quantity':snap['quantity'],'submitted_at':self.clock(),'status':'intent'}
+            self._save()
+            return {'ok':True,'authorize_click':True,'target_price':plan['target_price']}
+
     def bridge_result(self, body):
         with self.lock:
             jid = body.get('job_id')
@@ -2090,6 +2134,25 @@ class Engine(PhaseAccounting, ProfitClaims):
                             'price_source': 'observed_entry', 'browser_position_id': snapshot['position_id']}
                 self.data['positions'][position['id']] = position
                 self._log('success', f"{account['name']} 浏览器已观察到开仓，已记录页面入场价")
+                raw=body.get('snapshot') or {}
+                if 'native_sl_price' in raw or 'stop_check' in raw:
+                    try:protection=stop_plan(snapshot,job.get('stop_loss'))
+                    except ValueError as exc:protection={'status':'failed','error':str(exc)}
+                    reported=raw.get('stop_check')
+                    if isinstance(reported,dict) and reported.get('status')=='failed':
+                        protection.update(status='failed',error=str(reported.get('error','止损校正未确认'))[:250])
+                    if job.get('stop_amendment'):
+                        if snapshot.get('position_id')!=job['stop_amendment']['position_id'] or not math.isclose(snapshot['entry_price'],job['stop_amendment']['entry_price'],rel_tol=0,abs_tol=1e-8):
+                            protection.update(status='failed',error='止损校正回执的持仓或成交均价变化')
+                        job['stop_amendment']['status']='verified' if protection['status']=='verified' else 'unknown'
+                    position['stop_protection']={**protection,'observed_at':snapshot['observed_at'],
+                        'trigger_price':snapshot.get('native_sl_price'),
+                        'corrected':bool(job.get('stop_amendment')) and protection['status']=='verified'}
+                    job['stop_check']=copy.deepcopy(position['stop_protection'])
+                    if protection['status'] not in ('verified','omitted'):
+                        self._freeze(account['id'],f"{account['name']} 开仓已确认，但止损金额校验失败：{protection.get('error','实际止损与配置不一致')}；保留持仓并暂停后续开仓，请核对")
+                    else:
+                        self._log('info',f"{account['name']} 成交后止损{'已校正并' if job.get('stop_amendment') else ''}核验：实际风险 {protection.get('actual_risk')} USDC，配置 {job.get('stop_loss')} USDC")
             else:
                 position = self.data['positions'].get(job['local_position_id'])
                 if not position:

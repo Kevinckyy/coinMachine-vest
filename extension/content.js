@@ -1,7 +1,7 @@
 /* Operates only the public webpage DOM; never reads the website's credentials. */
 (() => {
   'use strict';
-  const VERSION = '0.3.24';
+  const VERSION = '0.3.25';
   const CONTROLLER = '__vestControlBridgeController';
   // A previous injection may belong to a reloaded extension context. Retire it
   // instead of trusting a boolean marker that can outlive its message listener.
@@ -367,6 +367,7 @@
   }
   async function awaitPosition(job, oldIds, expectedPosition) {
     const until = Date.now() + 12000;
+    let filled=null;
     while (Date.now() < until) {
       await delay(350);
       await ensurePositionPanelLayout(() => assertArmed(job));
@@ -375,15 +376,30 @@
       const current = assertAccount(job.type === 'open');
       if (job.type === 'open' && current.position_open) {
         if (oldIds.has(current.position_id) || !core.matchesPosition(current, job)) throw new Error('页面持仓 ID、方向或数量不符合本次订单，禁止认作成交');
+        filled=current;
         // The entry request and native protection can be accepted separately. Wait for both visible legs.
-        const stopMatches = job.stop_loss == null ? current.native_sl_absent : current.native_sl;
+        const stopMatches = job.stop_loss == null ? current.native_sl_absent : current.native_sl_price > 0;
         if (stopMatches && (job.take_profit == null ? current.native_tp_price == null : current.native_tp)) return current;
       } else if (job.type === 'close') {
         if (current.position_open && !core.matchesPosition(current, expectedPosition)) throw new Error('等待平仓时持仓 ID、方向或数量变化，停止执行');
         if (!current.position_open && !closeDialog) return current;
       }
     }
+    if(job.type==='open'&&filled)return {...filled,stop_check:{status:'failed',error:'成交已确认，但保护状态未及时显示'}};
     throw new Error('12 秒内未观察到明确成交及保护状态；不得自动重试，请手工核对');
+  }
+  async function calibrateStop(job,filled) {
+    if(filled.stop_check?.status==='failed')return filled;
+    if(!globalThis.VestStopProtection)return {...filled,stop_check:{status:'failed',error:'止损校验模块未加载，请重载插件'}};
+    const corrected=await globalThis.VestStopProtection.correct({
+      guard:assertArmed,noDialogs:assertNoDialogs,read:()=>assertAccount(false),
+      one:queryOne,click,delay,visible,
+      intent:(task,current,price)=>call('stop-protection',{job_id:task.id,account_id:config.accountId,
+        session_id:executionSession,mode_epoch:executionEpoch,identity:config.identity,phase:config.phase,
+        snapshot:current,target_price:price}),
+    },job,filled);
+    if(job.take_profit!=null&&!corrected.native_tp)return {...corrected,stop_check:{status:'failed',error:'开仓已成交，但止盈保护未确认'}};
+    return corrected;
   }
   async function selectPositionSize(job) {
     assertArmed(job); assertNoDialogs();
@@ -456,7 +472,7 @@
       await delay(500);
       // This selector is a cost / risk warning, NOT a routine order confirmation.
       assertNoDialogs();
-      return await awaitPosition(job, oldIds);
+      return await calibrateStop(job,await awaitPosition(job, oldIds));
     }
     if (before.position_open !== true) throw new Error('持仓状态不匹配，请手工核对');
     const expectedPosition = { position_id: job.browser_position_id || job.position_id, symbol: job.symbol, side: job.side, quantity: job.quantity };

@@ -103,7 +103,7 @@ test('a pre-existing Vest tab with no receiver gets one isolated-world injection
   assert.equal(h.state.injections.length, 1);
   assert.deepEqual(h.state.injections[0].target, { tabId: 42, frameIds: [0] });
   assert.equal(h.state.injections[0].world, 'ISOLATED');
-  assert.deepEqual(h.state.injections[0].files, ['core.js', 'profit-claim.js', 'content.js']);
+  assert.deepEqual(h.state.injections[0].files, ['core.js', 'profit-claim.js', 'stop-protection.js', 'content.js']);
   assert.equal(h.state.messages.filter(item => item.message.type === 'bridge-ping').length, 2);
   assert.equal(h.business().filter(item => item.message.type === 'capture').length, 1);
   assert.equal(h.business()[0].options.frameId, 0);

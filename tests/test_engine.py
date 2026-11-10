@@ -1060,6 +1060,15 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.request('OPTIONS','/api/bridge/size',headers={'Origin':extension})[0],204)
         self.assertEqual(self.request('POST','/api/bridge/size',{},headers)[0],409)
 
+    def test_stop_protection_http_requires_pairing_and_delivered_entry(self):
+        extension='chrome-extension://'+'e'*32
+        headers={'Origin':extension,'Content-Type':'application/json'}
+        path='/api/bridge/stop-protection'
+        self.assertEqual(self.request('POST',path,{},headers)[0],401)
+        headers['X-Bridge-Token']=self.engine.bridge_token
+        self.assertEqual(self.request('OPTIONS',path,headers={'Origin':extension})[0],204)
+        self.assertEqual(self.request('POST',path,{},headers)[0],409)
+
     def test_preparation_http_requires_pairing_and_never_grants_permission(self):
         before_sessions = copy.deepcopy(self.engine.data['execution_sessions'])
         before_jobs = copy.deepcopy(self.engine.data['jobs'])

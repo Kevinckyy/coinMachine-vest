@@ -295,7 +295,7 @@ async function ensureContentScript(tabId) {
     if (!chrome.scripting?.executeScript) throw new Error('扩展尚未加载新版脚本权限，请在扩展管理页重新加载 VEST Control，并允许访问 Vest 网站');
     try {
       await bounded(chrome.scripting.executeScript({
-        target: { tabId, frameIds: [0] }, world: 'ISOLATED', files: ['core.js', 'profit-claim.js', 'content.js'],
+        target: { tabId, frameIds: [0] }, world: 'ISOLATED', files: ['core.js', 'profit-claim.js', 'stop-protection.js', 'content.js'],
       }), 7000, '加载页面脚本超时');
     } catch (error) {
       throw new Error('无法连接 Vest 页面脚本：' + error.message + '。请检查扩展的站点访问权限，然后刷新 Vest 页面');
@@ -635,6 +635,18 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
         mode_epoch:state.mode_epoch,phase:account.phase,size_percent:message.size_percent,quantity:message.quantity,snapshot:message.snapshot,tab_url:sender.url,
         ...(message.drawdown !== undefined ? {drawdown:message.drawdown,stop_loss:message.stop_loss} : {}),
       },observation.token);
+    }
+    if(message.type==='stop-protection'){
+      if(!sender.tab||!sender.url?.startsWith('https://next.vestmarkets.com/trade/'))throw new Error('止损校正必须在 Vest 交易页面运行');
+      const observation=await observationConfig(sender.tab.id),state=await controlState(sender.tab.id);
+      if(state.mode!=='execute'||message.mode_epoch!==state.mode_epoch||message.session_id!==observation.session_id)throw new Error('止损校正执行授权已失效');
+      const health=await connectionHealth(sender.tab.id);
+      if(health?.mode_epoch===state.mode_epoch&&health.blocked)throw new Error('本地连接待恢复，未修改止损');
+      const account=observation.registrations?.find(a=>a.id===message.account_id&&a.identity===message.identity);
+      if(!account||account.execution_excluded)throw new Error('止损校正账户无法确认');
+      return await localRequest('/api/bridge/stop-protection',{job_id:message.job_id,account_id:account.id,
+        session_id:observation.session_id,mode_epoch:state.mode_epoch,identity:account.identity,phase:account.phase,
+        snapshot:message.snapshot,target_price:message.target_price,tab_url:sender.url},observation.token);
     }
     if (message.type === 'poll' || message.type === 'result') {
       if (!sender.tab || !sender.url?.startsWith('https://next.vestmarkets.com/trade/')) throw new Error('必须在 Vest 交易标签页运行');
