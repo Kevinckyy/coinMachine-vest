@@ -87,8 +87,9 @@
     function navigate(path,pattern) {
       own();if(dialogs().length)throw new Error('存在额外弹窗，禁止切换领取页面');
       const links=[...document.querySelectorAll('a[href]')].filter(e=>a.visible(e)&&e.origin===location.origin&&path.includes(e.pathname)&&pattern.test(a.text(e)));
-      if(links.length!==1)throw new Error('领取流程的导航入口不唯一');
-      a.click(links[0]);
+      const link=globalThis.VestBridgeCore.sameDestinationNavigation(links);
+      if(!link)throw new Error('领取流程的导航目标地址不唯一');
+      a.click(link);
     }
     function edit(input,value) {
       if(!(input instanceof HTMLInputElement)||input.disabled||input.readOnly)throw new Error('领取输入框不可编辑');

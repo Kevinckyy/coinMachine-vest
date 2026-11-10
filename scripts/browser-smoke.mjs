@@ -136,7 +136,7 @@ try {
   };
   const runProfitClaimFixtures=async()=>{
     const results=[];
-    for(const options of [{},{precision:true},{mode:'amount'},{mode:'percent'},{recipient:true},{noReset:true},
+    for(const options of [{},{duplicateNavigation:true},{precision:true},{mode:'amount'},{mode:'percent'},{recipient:true},{noReset:true},
       {lostIntent:true},{revoke:true},{switchAccount:true},{sticky:true},{unknownSuccess:true},{orderOpen:true},{positionOpen:true}]){
       await command('Page.navigate',{url:base+'/api/health'});
       await until(()=>evaluate(`document.readyState==='complete'&&location.pathname==='/api/health'`),'profit claim fixture');

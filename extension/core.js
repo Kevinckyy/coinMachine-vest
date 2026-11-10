@@ -93,7 +93,9 @@
       const text=normalized(value);
       if (/^(?:live(?: funded)?(?: account)?|funded(?: account)?|实盘(?:账户)?|實盤(?:帳戶)?|资金账户|資金帳戶)$/i.test(text)) return 'live';
       const match=text.match(/^(?:(?:step|stage|phase|evaluation)\s*)?([12])\s*(?:\/|of)\s*2$/i) ||
-        text.match(/^第\s*([12])\s*\/\s*2\s*(?:阶段|階段)$/);
+        text.match(/^第\s*([12])\s*\/\s*2\s*(?:阶段|階段)$/) ||
+        text.match(/^第\s*([12])\s*(?:阶段盈利目标|階段盈利目標)\s*[:：]/) ||
+        text.match(/^(?:Step|Stage|Phase)\s*([12])\s+Profit Target\s*[:：]/i);
       return match ? match[1]+'/2' : null;
     }).filter(Boolean);
     const distinct=[...new Set(phases)];
@@ -178,5 +180,10 @@
     try {seconds=accountScanTimeoutSeconds(progress?.account_timeout_seconds??3);} catch {}
     return Math.max(65000,seconds*1000+20000);
   }
-  root.VestBridgeCore = { FIELDS, defaults, parseMoney, normalized, isNqTradePath, canonicalNqPosition, CAPITAL_INDICATORS, parseCapitalMetric, accountCategory, terminalNoticeReason, liveActivationNotice, accountScanTimeoutSeconds, accountScanIdleTimeoutMs, accountPhase, positionState, parseSide, sameQuantity, nqInputToVest, nqVestToInput, matchesPosition, executionExcluded, assertExecutionAllowed, validateJob, strategyStopLoss };
+  function sameDestinationNavigation(links) {
+    // Desktop header/sidebar may render the same native navigation twice.
+    // Callers first restrict visibility, label, origin and allowed paths.
+    return links.length && links.every(link=>link.href===links[0].href) ? links[0] : null;
+  }
+  root.VestBridgeCore = { FIELDS, defaults, parseMoney, normalized, isNqTradePath, canonicalNqPosition, CAPITAL_INDICATORS, parseCapitalMetric, accountCategory, terminalNoticeReason, liveActivationNotice, accountScanTimeoutSeconds, accountScanIdleTimeoutMs, accountPhase, positionState, parseSide, sameQuantity, nqInputToVest, nqVestToInput, matchesPosition, executionExcluded, assertExecutionAllowed, validateJob, strategyStopLoss, sameDestinationNavigation };
 })(globalThis);

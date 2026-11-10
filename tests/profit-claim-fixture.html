@@ -23,6 +23,7 @@
  const reply=data=>({ok:true,data:{mode:'execute',mode_epoch:1,accounts:[structuredClone(account)],...data}});
  const money=()=>{document.querySelector('[data-testid="account-value"]').textContent='$'+state.balance.toFixed(2);};money();
  function navigate(path){history.pushState(null,'',path);document.getElementById('trade-page').style.display=path==='/portfolio'?'none':'';document.getElementById('portfolio-page').style.display=path==='/portfolio'?'':'none';}
+ if(options.duplicateNavigation){const nav=document.querySelector('nav').cloneNode(true);document.body.append(nav);}
  for(const link of document.querySelectorAll('nav a'))link.onclick=e=>{e.preventDefault();navigate(link.pathname);};
  function open(){
    const dialog=document.createElement('div');dialog.setAttribute('role','dialog');dialog.dataset.slot='dialog-content';

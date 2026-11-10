@@ -89,7 +89,7 @@ Vest Capital 当前没有官方交易 API；本项目采用浏览器界面桥接
 
 ### 读取账户并切换模式
 
-1. 在 `edge://extensions` 或 `chrome://extensions` 加载 `extension/` 或已解压的 `vest-browser-bridge/`，已安装时重新加载至 **0.3.25**。
+1. 在 `edge://extensions` 或 `chrome://extensions` 加载 `extension/` 或已解压的 `vest-browser-bridge/`，已安装时重新加载至 **0.3.27**。
 2. 登录 **https://next.vestmarkets.com/trade/NQ-PERP**，在工作台「浏览器连接」复制本地配对码并粘贴到插件。
 3. 点击 **读取 / 刷新账户**。插件逐个读取账户名称、类别、净值与浮盈亏，完成后恢复原选账户；真实账户会自动出现在工作台同一张账户表中。
 4. 在插件切换 **只读 / 执行**。只读模式只同步信息；开启时确认连接及账户身份；空闲不切换账户或准备表单。有下单任务时才准备市价、Micro 微型数量单位及 USD 止损；持仓监控和平仓不要求开仓表单。报错会保留在插件中，重新打开仍可查看。

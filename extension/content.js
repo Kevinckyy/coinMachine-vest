@@ -1,7 +1,7 @@
 /* Operates only the public webpage DOM; never reads the website's credentials. */
 (() => {
   'use strict';
-  const VERSION = '0.3.25';
+  const VERSION = '0.3.27';
   const CONTROLLER = '__vestControlBridgeController';
   // A previous injection may belong to a reloaded extension context. Retire it
   // instead of trusting a boolean marker that can outlive its message listener.
@@ -568,7 +568,11 @@
     const name = core.normalized(names[0].textContent);
     if (!name) throw new Error('账户名称为空，请确认已登录');
     const labels = [...trigger.querySelectorAll('span')].filter(el => visible(el) && el !== names[0] && !el.contains(names[0])).map(el => core.normalized(el.textContent));
-    const phaseLabels=[...document.querySelectorAll('div.sticky.top-14 [data-slot="badge"]')]
+    // Vest replaces the 2/2 badge with "Evaluation Passed" while its native
+    // result modal is open. The exact stage Profit Target label in the same
+    // account banner remains explicit phase evidence; the modal text alone is
+    // insufficient. Conflicting badge/goal phases still resolve to unknown.
+    const phaseLabels=[...document.querySelectorAll('div.sticky.top-14 [data-slot="badge"],div.sticky.top-14 p')]
       .filter(el=>visible(el)&&!el.closest('[role="dialog"],[role="menu"]')).map(el=>core.normalized(el.textContent));
     const phase=core.accountPhase([...labels,...phaseLabels]);
     return { name, signature: core.normalized(trigger.textContent)+(phase?'|'+phase:''), phase,
@@ -1119,8 +1123,9 @@
       if (!pending.returnClicked) {
         const links=[...document.querySelectorAll('a[href]')].filter(el=>visible(el)&&/^(?:交易|Trade)$/i.test(elementText(el))&&
           el.origin===location.origin && ['/trade','/trade/NQ-PERP','/trade/NDX-USD-PERP'].includes(el.pathname));
-        if (links.length!==1) {lastDiagnostic='Live 已激活，等待唯一交易导航出现';return true;}
-        assertExecution(epoch);pending.returnClicked=true;click(links[0]);
+        const link=core.sameDestinationNavigation(links);
+        if (!link) {lastDiagnostic='Live 已激活，等待交易导航提供唯一目标地址';return true;}
+        assertExecution(epoch);pending.returnClicked=true;click(link);
       }
       return true;
     }

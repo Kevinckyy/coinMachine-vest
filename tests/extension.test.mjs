@@ -201,3 +201,23 @@ test('a job from another account phase cannot execute even if the account id is 
   assert.throws(()=>validateJob(job,{accountId:'phase-account',phase:'2/2'}),/阶段/);
   assert.equal(validateJob({...job,phase:'2/2'},{accountId:'phase-account',phase:'2/2'}).phase,'2/2');
 });
+
+test('passed account stage is read from explicit goal labels and conflicting evidence stays unknown',()=>{
+  const parse=sandbox.VestBridgeCore.accountPhase;
+  for(const label of ['第 2 阶段盈利目标: +$251.72 / $250','第2階段盈利目標：+$250 / $250','Step 2 Profit Target: +$250 / $250']){
+    assert.equal(parse(['评估已通过',label]),'2/2');
+    assert.equal(parse(['1/2',label]),null);
+    assert.equal(parse(['Live',label]),null);
+  }
+  assert.equal(parse(['第 1 阶段盈利目标: $100 / $200']),'1/2');
+  for(const label of ['评估已通过','恭喜通过第二阶段','Account 2 Profit Target: 250','第 2 阶段盈利目标可能达到250'])assert.equal(parse([label]),null);
+});
+
+test('duplicate native navigation is accepted only for one exact destination',()=>{
+  const choose=sandbox.VestBridgeCore.sameDestinationNavigation;
+  const first={href:'https://next.vestmarkets.com/trade'};
+  assert.equal(choose([first,{...first}]),first);
+  assert.equal(choose([]),null);
+  assert.equal(choose([first,{href:first.href+'/NQ-PERP'}]),null);
+  assert.equal(choose([first,{href:first.href+'?account=other'}]),null);
+});

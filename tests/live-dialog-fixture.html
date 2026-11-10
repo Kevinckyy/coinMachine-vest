@@ -1,7 +1,7 @@
 <!doctype html><html><head><meta charset="utf-8"><title>Isolated evaluation passed to Live</title></head><body>
 <button data-testid="account-selector-trigger"><span class="truncate">Same Name</span><span id="category">已通过</span></button>
 <p data-testid="account-value">$5,250.21</p><p data-testid="account-upnl">$253.00</p><p data-testid="book-mark">$100.00</p>
-<div class="sticky top-14"><span id="phase" data-slot="badge">第 2/2 阶段</span></div>
+<div class="sticky top-14"><span id="phase" data-slot="badge">第 2/2 阶段</span><p id="phase-goal"></p></div>
 <div data-testid="order-form"><button data-testid="ordertype-tab-market" aria-selected="true">Market</button><input data-testid="size-input" value="1"><button data-testid="size-unit-select" data-unit="micro">Micro</button><button data-testid="tpsl-unit-usd" aria-selected="true">USD</button><input data-testid="tpsl-input-tp"><input data-testid="tpsl-input-sl"><button data-testid="submit-long">Buy</button><button data-testid="submit-short">Sell</button></div>
 <button data-testid="account-tab-active-positions" aria-selected="true" aria-controls="positions">Active Positions</button><div id="positions"><p>No positions yet</p></div>
 <script>
@@ -49,15 +49,18 @@
  }
  function activated(){
   document.querySelector('[role="dialog"]')?.remove();document.getElementById('phase').textContent='Live';document.getElementById('category').textContent='Funded Account';
+  document.getElementById('phase-goal').textContent='';document.getElementById('phase-goal').style.display='';
   document.querySelector('[data-testid="account-value"]').textContent='$5,000.00';document.querySelector('[data-testid="account-upnl"]').textContent='$0.00';
   history.pushState(null,'','/portfolio');
   const link=document.createElement('a');link.id='return-trade';link.href='/trade';link.textContent='交易';link.onclick=e=>{e.preventDefault();state.returns++;history.pushState(null,'','/trade/NQ-PERP');};document.body.append(link);
+  const duplicate=link.cloneNode(true);duplicate.id='return-trade-sidebar';duplicate.onclick=link.onclick;document.body.append(duplicate);
  }
  async function setup(locale='zh'){
-  document.querySelectorAll('[role="dialog"],[role="alertdialog"],#return-trade,[data-testid="confirm-order-submit"]').forEach(e=>e.remove());
+  document.querySelectorAll('[role="dialog"],[role="alertdialog"],#return-trade,#return-trade-sidebar,[data-testid="confirm-order-submit"]').forEach(e=>e.remove());
   Object.assign(state,{clicks:0,returns:0,messages:[],attempts:{},offset:0,locked:true,locale,revoke:false});
   Object.assign(account,{phase:'2/2',category:'eval',identity:'eval:Same Name',balance:5000,equity:5253,unrealized_pnl:253,strategy_locked:false});
   document.querySelector('[data-testid="account-selector-trigger"] .truncate').textContent=account.name;document.getElementById('category').textContent='已通过';document.getElementById('phase').textContent='第 2/2 阶段';
+  document.getElementById('phase-goal').textContent='';document.getElementById('phase-goal').style.display='';
   document.querySelector('[data-testid="account-value"]').textContent='$5,250.21';document.querySelector('[data-testid="account-upnl"]').textContent='$253.00';
   history.replaceState(null,'','/trade/NQ-PERP');await mode('execute');show();
  }
@@ -72,11 +75,23 @@
    assert(!state.messages.some(m=>['execution-failed','result','size','poll'].includes(m.type)),'Activation revoked or traded');
    checks.push(locale+': one activation, portfolio return, fresh Live proof, lock='+locked);
   }
+  for(const [locale,badge,goal] of [['zh','评估已通过','第 2 阶段盈利目标: +$251.72 / $250'],['en','Evaluation Passed','Step 2 Profit Target: +$251.72 / $250']]){
+   await setup(locale);document.getElementById('phase').textContent=badge;document.getElementById('phase-goal').textContent=goal;
+   await state.timer();await state.timer();assert(state.clicks===1,'Passed badge with explicit goal did not activate exactly once');
+   activated();await state.timer();await state.timer();
+   assert(account.phase==='live'&&account.strategy_locked&&state.returns===1,'Goal-label transition did not verify Live and preserve default lock');
+   assert(!state.messages.some(m=>['execution-failed','result','size','poll'].includes(m.type)),'Passed goal-label transition revoked or traded');
+   checks.push(locale+': real passed badge uses explicit stage goal, one activation and locked Live proof');
+  }
   for(const [label,mutate] of [
    ['wrong title',()=>document.querySelector('[data-slot="dialog-title"]').textContent='付款完成'],
    ['wrong description',()=>document.querySelector('[data-slot="dialog-header"]>div').textContent='请购买新的资金账户'],
    ['extra dialog',()=>{const d=document.createElement('div');d.setAttribute('role','alertdialog');d.textContent='Risk';document.body.append(d);}],
    ['wrong current phase',()=>document.getElementById('phase').textContent='第 1/2 阶段'],
+   ['passed without stage evidence',()=>document.getElementById('phase').textContent='评估已通过'],
+   ['conflicting banner stage',()=>document.getElementById('phase-goal').textContent='第 1 阶段盈利目标: $100 / $200'],
+   ['hidden stage goal',()=>{document.getElementById('phase').textContent='评估已通过';const g=document.getElementById('phase-goal');g.textContent='第 2 阶段盈利目标: $250 / $250';g.style.display='none';}],
+   ['dialog stage is not account banner evidence',()=>{document.getElementById('phase').textContent='评估已通过';document.querySelector('[role="dialog"]').insertAdjacentHTML('beforeend','<p>第 2 阶段盈利目标: $250 / $250</p>');}],
    ['wrong account',()=>document.querySelector('[data-testid="account-selector-trigger"] .truncate').textContent='Other'],
    ['not passed',()=>document.getElementById('category').textContent='Evaluation'],
    ['order confirmation',()=>{const b=document.createElement('button');b.dataset.testid='confirm-order-submit';document.querySelector('[role="dialog"]').append(b);}],
