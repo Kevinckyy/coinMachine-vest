@@ -1,6 +1,7 @@
 """Native NQ stop risk uses canonical position quantity, without a futures multiplier."""
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 import math
+
+NQ_PRICE_TICK = 0.25
 
 
 def stop_plan(position, target):
@@ -12,10 +13,12 @@ def stop_plan(position, target):
                for v in (entry, quantity, target)) or position.get('side') not in ('buy', 'sell'):
         raise ValueError('止损校验缺少真实成交均价、数量或方向')
     sign = 1 if position['side'] == 'sell' else -1
-    # The public position table and editor show NQ prices to cents. If the
-    # requested risk cannot be represented, round toward entry, never away.
-    raw = Decimal(str(entry)) + sign * Decimal(str(target)) / Decimal(str(quantity))
-    price = float(raw.quantize(Decimal('.01'), rounding=ROUND_FLOOR if sign == 1 else ROUND_CEILING))
+    ticks = (entry + sign * target / quantity) / NQ_PRICE_TICK
+    if not math.isfinite(ticks):
+        raise ValueError('无法计算有效止损触发价')
+    # Match the browser's nearest-tick calculation, with ties toward entry.
+    nearest_tick = math.ceil(ticks - 0.5) if sign == 1 else math.floor(ticks + 0.5)
+    price = nearest_tick * NQ_PRICE_TICK
     if price <= 0 or sign * (price - entry) <= 0:
         raise ValueError('止损金额小于当前数量可表示的最小价格间距')
     stop = position.get('native_sl_price')

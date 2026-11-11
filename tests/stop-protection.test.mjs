@@ -14,12 +14,21 @@ test('actual entry, canonical quantity and native stop determine risk for either
     assert.equal(plan({...fill,native_sl_price:28000+sign*32.5},130).status,'verified');
   }
 });
-test('unrepresentable risk rounds toward entry and explicit omitted stops stay omitted',()=>{
+test('NQ stops use the nearest quarter point, with exact midpoints rounded toward entry',()=>{
   for(const side of ['buy','sell']){
-    const fill={side,entry_price:28000,quantity:3};
-    const p=plan(fill,130),actual=plan({...fill,native_sl_price:p.target_price},130);
-    assert.equal(actual.status,'verified');assert.ok(actual.actual_risk<=130&&actual.actual_risk>129.97);
+    const sign = side === 'sell' ? 1 : -1;
+    for (const [quantity, target, distance, risk] of [[3, 130, 43.25, 129.75], [6, 130, 21.75, 130.5], [4, 130.5, 32.5, 130]]) {
+      const price = 28000 + sign * distance;
+      const fill = {side, entry_price: 28000, quantity, native_sl_price: price};
+      const result = plan(fill, target);
+      assert.equal(result.target_price, price);
+      assert.equal(result.actual_risk, risk);
+      assert.equal(result.status, 'verified');
+      assert.equal(plan({...fill, native_sl_price: price + sign * 0.01}, target).status, 'mismatch');
+    }
   }
+});
+test('explicitly omitted stops stay omitted',()=>{
   assert.equal(plan({native_sl_absent:true},null).status,'omitted');
   assert.equal(plan({native_sl_price:100},null).status,'mismatch');
   assert.throws(()=>plan({side:'buy',quantity:0,entry_price:100},130));

@@ -1,12 +1,18 @@
 /* Post-fill native stop calibration. One scoped amendment; never resubmits entry. */
 (() => {
   'use strict';
+  const NQ_PRICE_TICK = 0.25;
+
   function plan(position, target) {
     if (target == null) return {status:position.native_sl_absent === true ? 'omitted' : 'mismatch',target_risk:null,actual_risk:null,target_price:null};
     const {entry_price:entry,quantity,side,native_sl_price:stop}=position;
     if (![entry,quantity,target].every(v=>typeof v==='number'&&Number.isFinite(v)&&v>0)||!['buy','sell'].includes(side)) throw Error('止损校验缺少真实成交均价、数量或方向');
-    const sign=side==='sell'?1:-1, raw=entry+sign*target/quantity;
-    const price=(sign===1?Math.floor(raw*100+1e-7):Math.ceil(raw*100-1e-7))/100;
+    const sign = side === 'sell' ? 1 : -1;
+    const ticks = (entry + sign * target / quantity) / NQ_PRICE_TICK;
+    if (!Number.isFinite(ticks)) throw Error('无法计算有效止损触发价');
+    // At the midpoint, choose the tick with lower risk.
+    const nearestTick = side === 'sell' ? Math.ceil(ticks - 0.5) : Math.floor(ticks + 0.5);
+    const price = nearestTick * NQ_PRICE_TICK;
     if (!(price>0&&sign*(price-entry)>0)) throw Error('止损金额小于当前数量可表示的最小价格间距');
     const actual=typeof stop==='number'&&Number.isFinite(stop)&&stop>0?sign*(stop-entry)*quantity:null;
     return {status:actual>0&&Math.abs(stop-price)<1e-6?'verified':'mismatch',target_risk:target,

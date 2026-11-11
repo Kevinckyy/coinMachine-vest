@@ -42,21 +42,28 @@ class StopProtectionTests(unittest.TestCase):
         self.assertEqual(p['status'],'verified')
         self.assertEqual(p['actual_risk'],130)
 
-    def test_unrepresentable_amount_rounds_toward_entry(self):
+    def test_nearest_quarter_point_and_midpoint_toward_entry(self):
         for side in ('buy','sell'):
-            p=stop_plan({**self.fill,'side':side,'quantity':3},130)
-            checked=stop_plan({**self.fill,'side':side,'quantity':3,'native_sl_price':p['target_price']},130)
-            self.assertEqual(checked['status'],'verified')
-            self.assertLessEqual(checked['actual_risk'],130)
-            self.assertGreater(checked['actual_risk'],129.97)
+            sign = 1 if side == 'sell' else -1
+            for quantity, target, distance, risk in ((3, 130, 43.25, 129.75), (6, 130, 21.75, 130.5), (4, 130.5, 32.5, 130)):
+                with self.subTest(side=side, quantity=quantity, target=target):
+                    price = self.fill['entry_price'] + sign * distance
+                    fill = {**self.fill, 'side': side, 'quantity': quantity, 'native_sl_price': price}
+                    checked = stop_plan(fill, target)
+                    self.assertEqual(checked['target_price'], price)
+                    self.assertEqual(checked['actual_risk'], risk)
+                    self.assertEqual(checked['status'], 'verified')
+                    self.assertEqual(stop_plan({**fill, 'native_sl_price': price + sign * 0.01}, target)['status'], 'mismatch')
 
     def test_intent_is_persisted_once_and_corrected_result_records_fill(self):
-        self.assertTrue(self.engine.bridge_stop_protection(self.body)['authorize_click'])
-        self.assertFalse(self.engine.bridge_stop_protection(self.body)['authorize_click'])
-        self.assertEqual(self.engine.data['jobs'][self.job['id']]['stop_amendment']['position_id'],self.fill['position_id'])
-        self.result({**self.fill,'native_sl_price':28034,'stop_check':{'status':'verified','corrected':True}})
+        fill = {**self.fill, 'entry_price': 28001.56}
+        body = {**self.body, 'snapshot': fill}
+        self.assertTrue(self.engine.bridge_stop_protection(body)['authorize_click'])
+        self.assertFalse(self.engine.bridge_stop_protection(body)['authorize_click'])
+        self.assertEqual(self.engine.data['jobs'][self.job['id']]['stop_amendment']['position_id'],fill['position_id'])
+        self.result({**fill,'native_sl_price':28034,'stop_check':{'status':'verified','corrected':True}})
         pos=self.engine._position(self.account['id'])
-        self.assertEqual(pos['stop_protection']['actual_risk'],130)
+        self.assertEqual(pos['stop_protection']['actual_risk'],129.76)
         self.assertTrue(pos['stop_protection']['corrected'])
         self.assertEqual(self.engine.data['jobs'][self.job['id']]['status'],'confirmed')
 
@@ -85,7 +92,7 @@ class StopProtectionTests(unittest.TestCase):
         self.assertEqual(self.engine._position(self.account['id'])['stop_protection']['status'],'omitted')
 
     def test_intent_refuses_stale_wrong_account_size_phase_and_price(self):
-        for changes in ({'account_id':'other'},{'mode_epoch':0},{'target_price':28035},
+        for changes in ({'account_id':'other'},{'mode_epoch':0},{'target_price':28035},{'target_price':28034.01},
             {'snapshot':{**self.fill,'observed_at':self.now-6}},
             {'snapshot':{**self.fill,'quantity':8}},{'snapshot':{**self.fill,'side':'buy'}},
             {'snapshot':{**self.fill,'phase':'live'}},{'snapshot':{**self.fill,'position_open':False}}):
