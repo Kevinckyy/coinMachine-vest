@@ -77,6 +77,7 @@ function createHarness(options = {}) {
     }
     if (url.endsWith('/api/bridge/observe')) return response({ ok: true, accounts_received: body.accounts?.length || 0, accounts: clone(automatic) });
     if (url.endsWith('/api/bridge/poll')) return response({ job: null });
+    if (url.endsWith('/api/bridge/monitor')) return response({ job: null, mode:'execute', mode_epoch:body.mode_epoch });
     if (url.endsWith('/api/bridge/result')) return response({ ok: true });
     throw new Error('Fixture forbids unexpected API ' + url);
   };
@@ -446,6 +447,29 @@ test('a lost order poll response is never retried or softened into an observatio
   assert.equal(reply.ok,false);assert.equal(reply.code,'LOCAL_SERVICE_UNAVAILABLE');
   assert.equal(h.state.requests.filter(r=>r.url.endsWith('/api/bridge/poll')).length,1);
   assert.equal((await h.dispatch({type:'control-status',tabId:42})).data.connection_pending,false);
+});
+
+test('a lost position monitoring response holds execution and recovers without polling an order',async t=>{
+  const h=harness(t);await mode(h,'execute');
+  const original=(await h.dispatch({type:'control-status',tabId:42})).data;
+  const monitor={type:'monitor',account_id:automatic[0].id,identity:automatic[0].identity,
+    session_id:original.session_id,mode_epoch:original.mode_epoch,ready:true};
+  const grants=h.state.requests.filter(r=>r.body?.authorize===true).length;
+  h.state.fetchHandler=r=>{if(r.url.endsWith('/api/bridge/monitor'))throw new TypeError('Failed to fetch');};
+  const lost=await h.dispatch(monitor,pageSender);
+  assert.equal(lost.data.connection_pending,true);
+  assert.equal(lost.data.mode_epoch,original.mode_epoch);
+  const blocked=await h.dispatch({...monitor,type:'poll'},pageSender);
+  assert.equal(blocked.data.job,null);
+  assert.equal(h.state.requests.filter(r=>r.url.endsWith('/api/bridge/monitor')).length,1);
+  assert.equal(h.state.requests.some(r=>r.url.endsWith('/api/bridge/poll')),false);
+  h.state.fetchHandler=null;
+  assert.equal((await h.dispatch({type:'mode-heartbeat'},pageSender)).data.connection_pending,false);
+  const recovered=await h.dispatch(monitor,pageSender);
+  assert.equal(recovered.data.mode,'execute');
+  assert.equal(recovered.data.mode_epoch,original.mode_epoch);
+  assert.equal(recovered.data.job,null);
+  assert.equal(h.state.requests.filter(r=>r.body?.authorize===true).length,grants);
 });
 
 test('a truncated successful HTTP response holds execution but malformed JSON stops it',async t=>{

@@ -52,7 +52,7 @@
     if(m.type==='mode-heartbeat'){if(location.pathname==='/portfolio'){assert(m.profit_claim?.claim_id===claim.id,'Portfolio heartbeat lacked its reserved claim');state.portfolioHeartbeats++;}return reply({});}
     if(m.type==='execution-next')return reply({next_account:{...account,operation:claim.status==='verified'?'monitor':'profit-claim'},profit_claim:claim.status==='verified'?null:structuredClone(claim)});
     if(m.type==='observe')return reply({});
-    if(m.type==='poll'){state.normalPolls++;assert(claim.status==='verified','Normal order polling occurred before balance verification');return reply({job:null});}
+    if(m.type==='poll'||m.type==='monitor'){state.normalPolls++;assert(claim.status==='verified','Normal position monitoring occurred before balance verification');return reply({job:null});}
     if(m.type==='profit-claim'){
       assert(m.account_id===account.id&&m.name===account.name&&m.phase==='live','Claim identity mismatch');
       if(m.action==='reserve'){assert(m.snapshot.position_open===false,'Claim lacks flat proof');claim.status='preparing';claim.mode_epoch=1;return reply({claim:structuredClone(claim)});}

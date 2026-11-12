@@ -228,12 +228,12 @@
   };
   globalThis.runStopCalibrationFixtureTests=async()=>{
     const cases=[];const test=async(name,run)=>{try{await run();cases.push({name,passed:true});}catch(error){cases.push({name,passed:false,error:error.message});}};
-    await test('health falling below 25% after sizing skips before submit',async()=>{
+    await test('opening and sizing do not sample the live health widget',async()=>{
       const config=await setup('health-dropped','health-dropped');
       el('account-health').textContent='25%';
       const result=await deliver(config,{size_percent:25});
-      assert(state.sizing?.snapshot.account_health===25,'The threshold incorrectly blocked a 25% account');
-      assert(result.skip_reason==='account_health'&&result.snapshot.account_health===24&&state.orderClicks===0,'Low health allowed an opening click');
+      assert(state.sizing && !Object.hasOwn(state.sizing.snapshot,'account_health'),'Sizing checked live health');
+      assert(result.success && state.orderClicks===1 && !Object.hasOwn(result.snapshot,'account_health'),'Opening checked live health');
     });
     for(const side of ['buy','sell'])await test(side+' saves the nearest quarter-point stop once',async()=>{
       const config=await setup('drift-'+side,'drift');
@@ -297,6 +297,7 @@
       el('account-health').textContent='12%';
       const result = await deliver(config, { type: 'close', browser_position_id: 'close-position', position_id: 'close-position' });
       assert(result.success && result.confirmed && result.snapshot.position_open === false, 'Full close did not confirm');
+      assert(result.snapshot.account_health===12,'Post-close health was not sampled');
       assert(state.closeClicks === 1 && state.closeConfirmClicks === 1 && state.orderClicks === 0, 'Close used incorrect controls or repeated the action');
     });
     await test('different position id prevents clicking a close button', async () => {

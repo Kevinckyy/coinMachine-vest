@@ -1,8 +1,7 @@
 /* Operates only the public webpage DOM; never reads the website's credentials. */
 (() => {
   'use strict';
-  const VERSION = '0.3.29';
-  const MIN_ACCOUNT_HEALTH = 25;
+  const VERSION = '0.3.30';
   const CONTROLLER = '__vestControlBridgeController';
   // A previous injection may belong to a reloaded extension context. Retire it
   // instead of trusting a boolean marker that can outlive its message listener.
@@ -200,7 +199,6 @@
       equity,
       balance: equity !== null && pnl !== null ? Math.round((equity - pnl) * 100) / 100 : null,
       unrealized_pnl: pnl,
-      account_health: readAccountHealth()?.percent ?? null,
       price: numeric('price'),
       ...details,
       position_open: isOpen,
@@ -384,7 +382,7 @@
         if (stopMatches && (job.take_profit == null ? current.native_tp_price == null : current.native_tp)) return current;
       } else if (job.type === 'close') {
         if (current.position_open && !core.matchesPosition(current, expectedPosition)) throw new Error('等待平仓时持仓 ID、方向或数量变化，停止执行');
-        if (!current.position_open && !closeDialog) return current;
+        if (current.position_open === false && !closeDialog) return withFlatAccountHealth(current);
       }
     }
     if(job.type==='open'&&filled)return {...filled,stop_check:{status:'failed',error:'成交已确认，但保护状态未及时显示'}};
@@ -439,7 +437,7 @@
     const before = job.type === 'open' ? readyCheck() : assertAccount(false);
     if (job.type === 'open') {
       if (before.position_open !== false) throw new Error('账户已有持仓，不能重复开仓');
-      if (healthBlocksEntry(before)) return {...before, skip_reason:'account_health'};
+      if (accountHealthLocked()) return {...before, skip_reason:'account_health'};
       const oldIds = new Set([...document.querySelectorAll('[data-testid^="position-symbol-"]')]
         .map((el) => el.getAttribute('data-testid').slice('position-symbol-'.length)));
       if (job.size_percent === undefined) await setInput('quantity',core.nqVestToInput(job.quantity,config.inputUnit || 'token'));
@@ -453,7 +451,6 @@
           await setInput('stopLoss',stopDecision.stop_loss == null ? '' : stopDecision.stop_loss);
         }
         const sizingSnapshot = readyCheck();
-        if (healthBlocksEntry(sizingSnapshot)) return {...sizingSnapshot, skip_reason:'account_health'};
         const sized = await call('size',{ job_id:job.id,account_id:config.accountId,session_id:executionSession,
           mode_epoch:config.mode_epoch,identity:config.identity,size_percent:job.size_percent,quantity,snapshot:sizingSnapshot,
           ...(job.skip_stop_loss_on_low_drawdown ? {stop_loss:stopDecision.stop_loss,drawdown:stopDecision.drawdown} : {}) });
@@ -468,7 +465,7 @@
       }
       const submitSnapshot = readyCheck();
       if (submitSnapshot.position_open !== false) throw new Error('下单前持仓状态变化');
-      if (healthBlocksEntry(submitSnapshot)) return {...submitSnapshot, skip_reason:'account_health'};
+      if (accountHealthLocked()) return {...submitSnapshot, skip_reason:'account_health'};
       if (!core.sameQuantity(core.nqInputToVest(numeric('quantity'),config.inputUnit || 'token'),job.quantity)) throw new Error('提交前数量发生变化，未下单');
       if (job.size_percent !== undefined && Number(queryOne('[role="slider"]',mainForm(true),true).getAttribute('aria-valuenow'))!==job.size_percent) throw new Error('提交前仓位比例变化，未下单');
       if ((job.take_profit == null ? field('takeProfit',true).value.trim() !== '' : !core.sameQuantity(numeric('takeProfit'),job.take_profit)) ||
@@ -515,9 +512,8 @@
     return await awaitPosition(job, null, expectedPosition);
   }
 
-  function healthBlocksEntry(snapshot) {
-    return (Number.isFinite(snapshot.account_health) && snapshot.account_health < MIN_ACCOUNT_HEALTH) ||
-      sessionAccounts.some(account => account.id === config.accountId && account.health_unlock_at > Date.now() / 1000);
+  function accountHealthLocked() {
+    return sessionAccounts.some(account => account.id === config.accountId && account.health_unlock_at > Date.now() / 1000);
   }
 
   function executionResult(job, observed) {
@@ -616,12 +612,16 @@
     return first?.percent != null && first.percent <= 100 && readings.every(item => item?.percent === first.percent) ? first : null;
   }
 
+  function withFlatAccountHealth(current) {
+    return current.position_open === false ? {...current, account_health:readAccountHealth()?.percent ?? null} : current;
+  }
+
   function observerCapitalMetrics() {
     let phase=null;try{phase=observerIdentity().phase;}catch{}
     const eligible = el => visible(el) && !el.closest('[role="dialog"],[role="alertdialog"],[role="menu"]');
     const banners = [...document.querySelectorAll('div.sticky.top-14')].filter(eligible);
     const observed_at = Date.now() / 1000;
-    const metrics = Object.fromEntries(core.CAPITAL_INDICATORS.map(({key,testId,labels}) => {
+    return Object.fromEntries(core.CAPITAL_INDICATORS.map(({key,testId,labels}) => {
       // Desktop's top-left banner omits the goal/drawdown test IDs. Read only
       // exact labels inside that banner; never search unrelated account cards.
       let sources = banners.flatMap(banner => {
@@ -640,9 +640,6 @@
       const consistent = first && readings.every(item => item && ['current','limit','percent'].every(field => item[field] === first[field]));
       return [key,consistent ? {...first,observed_at,...(phase?{phase}:{})} : null];
     }));
-    const health = readAccountHealth();
-    metrics.health = health ? {...health, observed_at, ...(phase ? {phase} : {})} : null;
-    return metrics;
   }
   function bannerUnrealized() {
     // The desktop second-row banner has no account-upnl test ID. Read its
@@ -657,7 +654,7 @@
     const first=values[0];
     return {found:true,value:first!==null && values.every(value=>value===first) ? first : null};
   }
-  function observerValues(expectedName) {
+  function observerValues(expectedName, scanning = false) {
     observerAssertPage();
     const identity = observerIdentity();
     if (expectedName && identity.name !== expectedName) throw new Error('账户切换尚未确认，未读取资金数据');
@@ -666,13 +663,19 @@
     const unrealized = banner.found ? banner.value : core.parseMoney(elementText(queryOne('[data-testid="account-upnl"]', document, true)));
     if (equity === null || unrealized === null) throw new Error('净值或浮动盈亏不可读（可能开启隐私模式）');
     let phase_snapshot;
-    if(identity.phase)try{
-      const reading=snapshot(),after=observerIdentity();
+    if(identity.phase || scanning)try{
+      const current = snapshot();
+      const reading = scanning ? withFlatAccountHealth(current) : current;
+      const after=observerIdentity();
       if(after.name===identity.name&&after.phase===identity.phase)phase_snapshot=reading;
     }catch{}
     const observed_at=Date.now()/1000;
-    return { name: identity.name, equity, unrealized_pnl: unrealized, capital_metrics:observerCapitalMetrics(),
-      ...(identity.phase ? {phase:identity.phase,phase_observed_at:observed_at,phase_snapshot} : {}),
+    const capital_metrics = observerCapitalMetrics();
+    const percent = phase_snapshot?.account_health;
+    if (Number.isFinite(percent)) capital_metrics.health = {text:`${percent}%`,percent,current:null,limit:null,observed_at:phase_snapshot.observed_at};
+    return { name: identity.name, equity, unrealized_pnl: unrealized, capital_metrics,
+      ...(identity.phase ? {phase:identity.phase,phase_observed_at:observed_at} : {}),
+      ...(identity.phase || scanning ? {phase_snapshot} : {}),
       ...(identity.category ? { category: identity.category, identity: identity.category + ':' + identity.name, status_observed_at:Date.now()/1000 } : {}),
       balance: Math.round((equity - unrealized) * 100) / 100, observed_at, read_error: '' };
   }
@@ -730,7 +733,7 @@
       if (observerItems().length && trigger.getAttribute('aria-expanded') === 'true') trigger.click();
     }
   }
-  async function observerWaitStable(name, minimumDelay = 1000, { monitoring = false, samples = 3, deadline: outerDeadline = Infinity, sampleInterval = 250, guard = () => {} } = {}) {
+  async function observerWaitStable(name, minimumDelay = 1000, { monitoring = false, scanning = false, samples = 3, deadline: outerDeadline = Infinity, sampleInterval = 250, guard = () => {} } = {}) {
     guard();
     await delay(Math.min(minimumDelay,Math.max(0,outerDeadline-Date.now())));
     guard();
@@ -741,8 +744,8 @@
     while (Date.now() < deadline) {
       guard();
       try {
-        const value = observerValues(name);
-        const loadingFields=monitoring ? '[data-testid="account-value"],[data-testid="account-upnl"]' : '[data-testid="account-value"],[data-testid="account-upnl"],[data-testid="account-health"],[data-testid^="capital-indicator-"],div.sticky.top-14[aria-busy="true"],div.sticky.top-14 [aria-busy="true"],div.sticky.top-14[data-loading="true"],div.sticky.top-14 [data-loading="true"]';
+        const value = observerValues(name, scanning);
+        const loadingFields=monitoring ? '[data-testid="account-value"],[data-testid="account-upnl"]' : '[data-testid="account-value"],[data-testid="account-upnl"],[data-testid^="capital-indicator-"],div.sticky.top-14[aria-busy="true"],div.sticky.top-14 [aria-busy="true"],div.sticky.top-14[data-loading="true"],div.sticky.top-14 [data-loading="true"]';
         const pending = [...document.querySelectorAll(loadingFields)]
           .some((el) => visible(el) && el.closest('[aria-busy="true"],[data-loading="true"]'));
         if (pending) throw new Error('账户数据仍在加载');
@@ -886,7 +889,7 @@
         const deadline=Date.now()+timeout*1000,guard=readGuard(deadline);
         try {
           await observerSelect(account,guard,deadline);
-          const value = await observerWaitStable(account.name,200,{deadline,sampleInterval:100,guard});
+          const value = await observerWaitStable(account.name,200,{scanning:true,deadline,sampleInterval:100,guard});
           guard();
           Object.assign(account, value);
           account.scan_status='success';
@@ -1054,10 +1057,9 @@
         }
         const current = before && readFlat();
         if (current && Math.abs(current.balance - before.balance) <= 0.02) {
-          // Preserve an observed native close in the old ledger before selecting
-          // the successor account. ready:false cannot dispatch a trading job.
-          const reply = await call('poll', {account_id:account.id,session_id:executionSession,mode_epoch:epoch,
-            identity:account.identity,phase:'1/2',snapshot:current,ready:false});
+          // Preserve the confirmed native close before selecting the successor.
+          const reply = await call('monitor', {account_id:account.id,session_id:executionSession,mode_epoch:epoch,
+            identity:account.identity,phase:'1/2',snapshot:withFlatAccountHealth(current),ready:false});
           acceptSession(reply); assertExecution(epoch);
           if (reply.job) throw new Error('阶段切换只读核对收到交易任务，已停止操作');
         }
@@ -1383,10 +1385,11 @@
       const prepared = await prepareAccount(() => assertExecution(epoch), opening);
       assertExecution(epoch);
       const completedFlat = account.category === 'passed' && prepared.position_open === false;
-      const current = !opening || account.category === 'passed' ? prepared : readyCheck();
-      const result = await call('poll', { account_id: account.id, session_id: executionSession,
+      const current = !opening || account.category === 'passed' ? withFlatAccountHealth(prepared) : readyCheck();
+      const operation = completedFlat || routed.next_account.operation === 'monitor' ? 'monitor' : 'poll';
+      const result = await call(operation, { account_id: account.id, session_id: executionSession,
         mode_epoch: epoch, identity: account.identity, phase:account.phase, snapshot: current, ready: !completedFlat });
-      if (!result.job) { acceptSession(result); return; }
+      if (operation === 'monitor' || !result.job) { acceptSession(result); return; }
       receivedJob = result.job;
       try {
         assertExecution(epoch);

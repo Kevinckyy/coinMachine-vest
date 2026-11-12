@@ -73,7 +73,7 @@
         if(message.accounts.some(a=>a.name==='Alpha'&&['failed','closed'].includes(a.category)&&Date.now()/1000-a.status_observed_at<5))state.retired=true;
         return reply(options.revokeDuringArchive?{mode:'readonly',mode_epoch:2}:{});
       }
-      if(message.type==='poll'){
+      if(message.type==='poll' || message.type==='monitor'){
         if(options.collapsedPane&&document.getElementById('trade-account-tabs').getBoundingClientRect().height<200)throw new Error('Polling leased work before the virtual positions table can render');
         if(options.live&&!state.closed&&message.snapshot.unrealized_pnl!==-state.metricTicks)throw new Error('Poll did not read current second-row unrealized PnL');
         state.polls.push(message.account_id);return reply({job:null});

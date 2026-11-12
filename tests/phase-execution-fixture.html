@@ -43,9 +43,10 @@
       if (message.type==='observation-restore') return {ok:true,data:{enabled:true,mode_epoch:0,accounts:[clone(account)]}};
       if (message.type==='mode-heartbeat' || message.type==='observe') return response({});
       if (message.type==='execution-next') return response({next_account:{...clone(account),operation:state.job?.type || 'monitor'}});
-      if (message.type==='poll') {
+      if (message.type==='poll' || message.type==='monitor') {
         assert(message.phase===account.phase && message.snapshot.phase===(account.phase || undefined),'Mismatched phase in poll');
-        const job=state.job;state.job=null;
+        const job=message.type==='poll' ? state.job : null;
+        if (job) state.job=null;
         if (state.mutate) {state.mutate();state.mutate=null;}
         return response({job});
       }

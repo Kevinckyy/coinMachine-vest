@@ -7,6 +7,8 @@
 <div style="display:none"><p data-testid="capital-indicator-goal">$8,000.00 / $9,000.00</p></div>
 <div id="account-health">账户健康度 <p data-testid="account-health">90%</p></div>
 <div style="display:none"><p data-testid="account-health">0%</p></div>
+<button data-testid="account-tab-active-positions" aria-selected="true" aria-controls="fixture-positions">Active positions</button>
+<div id="fixture-positions"><p>No positions yet</p></div>
 <button data-testid="submit-long">Forbidden trading button</button>
 <pre id="fixture-result"></pre>
 <script>
@@ -83,6 +85,7 @@
     await test('current account can be read without order form, trade binding or TP/SL configuration',async()=>{
       const result=await send({type:'observe-current'});
       assert(result.ok&&result.snapshot.equity===987.5&&result.snapshot.unrealized_pnl===-12.5&&result.snapshot.balance===1000,'Direct current account monetary fields were wrong');
+      assert(!Object.hasOwn(result.snapshot.capital_metrics,'health'),'Routine observations must not sample health');
       assert(!document.querySelector('[data-testid="order-form"]'),'Fixture unexpectedly contains a trading form');
     });
     let scanned;

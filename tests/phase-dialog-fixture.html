@@ -64,9 +64,9 @@
       }
       return response({});
     }
-    if(message.type==='poll'){
+    if(message.type==='poll' || message.type==='monitor'){
       assert(message.phase===account.phase && message.snapshot.phase===account.phase,'Wrong phase polled');
-      if(state.onPoll && message.ready){
+      if(message.type==='poll' && state.onPoll && message.ready){
         state.onPoll=false;show(true);
         state.job={id:'old-phase-job',account_id:account.id,phase:'1/2',type:'open',symbol:'NQ-PERP',side:'buy',quantity:2,stop_loss:130,take_profit:null};
         return response({job:copy(state.job)});
@@ -103,11 +103,11 @@
       document.getElementById('advance').disabled=false;document.getElementById('advance').setAttribute('aria-busy','true');await state.timer();assert(state.clicks===0,'Busy button clicked');
       readiness(true);await state.timer();await state.timer();
       assert(state.clicks===1,'Next stage was not clicked exactly once');
-      assert(state.messages.some(m=>m.type==='poll' && m.phase==='1/2' && m.ready===false && m.snapshot.balance===5100),'Old-phase flat snapshot was not retained');
+      assert(state.messages.some(m=>m.type==='monitor' && m.phase==='1/2' && m.ready===false && m.snapshot.balance===5100),'Old-phase flat snapshot was not retained');
       successor();await state.timer();
       assert(account.id==='same-account' && account.phase==='2/2' && account.balance===5000,'Same-name successor was not synchronized');
       state.idle=false;await state.timer();
-      assert(state.messages.some(m=>m.type==='poll' && m.phase==='2/2'),'Next-stage monitoring did not resume');
+      assert(state.messages.some(m=>m.type==='monitor' && m.phase==='2/2'),'Next-stage monitoring did not resume');
       assert(!state.messages.some(m=>['execution-failed','result','size'].includes(m.type)),'Transition revoked permission or traded');
       checks.push(locale+': preparation, one click, old-phase snapshot, same-name 2/2 proof and monitoring');
     }
@@ -128,7 +128,7 @@
     const revoked=new Promise(resolve=>setTimeout(()=>mode('readonly').then(resolve),50));
     await state.timer();await revoked;assert(state.clicks===0,'Revocation during old-phase sampling allowed a click');checks.push('revocation during old-phase sampling prevents click');
     await setup();show(true);document.querySelector('[data-testid="account-value"]').setAttribute('aria-busy','true');await state.timer();
-    assert(state.clicks===1 && !state.messages.some(m=>m.type==='poll'),'Loading old-phase values were reported as settled');
+    assert(state.clicks===1 && !state.messages.some(m=>['poll','monitor'].includes(m.type)),'Loading old-phase values were reported as settled');
     successor();document.querySelector('[data-testid="account-value"]').removeAttribute('aria-busy');await state.timer();assert(account.phase==='2/2','Fresh successor proof was not synchronized');checks.push('loading old-phase values cannot fabricate a settlement');
     await setup();state.idle=false;state.onRoute=true;await state.timer();assert(state.clicks===1,'Dialog appearing during monitoring was not handled');successor();await state.timer();assert(account.phase==='2/2','Late dialog did not synchronize');checks.push('dialog appearing during monitoring is handled');
     await setup();state.idle=false;state.onPoll=true;await state.timer();assert(state.clicks===1 && state.job,'Delivered old-phase job was not held');successor();await state.timer();assert(account.phase==='2/2' && !state.job,'Delivered old-phase job was not retired on proof');assert(!state.messages.some(m=>m.type==='result'),'Old job got a fabricated result');checks.push('delivered old-phase job is retired only with new-phase flat proof');

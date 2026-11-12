@@ -17,12 +17,18 @@ class CapitalMetricsTests(unittest.TestCase):
     def metric(self, current=12.5, limit=130, **extra):
         return {'text':f'${current} / ${limit}','current':current,'limit':limit,'percent':None,'observed_at':self.now,**extra}
 
-    def read(self, metrics=None, *, name='Alpha', sid='capital-session-1', category='eval'):
+    def read(self, metrics=None, *, name='Alpha', sid='capital-session-1', category='eval', scanning=False, position_open=False):
         row = {'name':name,'category':category,'current':True,'balance':1000,'equity':1000,
                'unrealized_pnl':0,'observed_at':self.now}
         if metrics is not None:
             row['capital_metrics'] = metrics
+        if metrics and metrics.get('health'):
+            health = metrics['health']
+            row['phase_snapshot'] = dict(account_health=health['percent'],observed_at=health['observed_at'],position_open=position_open)
+        if scanning:
+            row['scan_status'] = 'success'
         return self.engine.bridge_session({'session_id':sid,'mode':'readonly','mode_epoch':0,
+            'progress':{'completed':1,'total':1} if scanning else None,
             'tab_url':'https://next.vestmarkets.com/trade/NQ-PERP','accounts':[row]})['accounts'][0]
 
     def test_all_three_metrics_roundtrip_with_independent_timestamps_and_no_trading_limit_substitution(self):
@@ -65,22 +71,24 @@ class CapitalMetricsTests(unittest.TestCase):
 
     def test_health_below_25_locks_through_trading_day_even_after_recovery(self):
         health = lambda percent, **extra: self.metric(None, None, text=f'{percent}%', percent=percent, **extra)
-        account = self.read({'health':health(25)})
+        self.assertFalse(self.read({'health':health(1)})['health_locked'])
+        self.assertFalse(self.read({'health':health(1)},scanning=True,position_open=True)['health_locked'])
+        account = self.read({'health':health(25)},scanning=True)
         self.assertFalse(account['health_locked'])
-        stale = self.read({'health':health(1, observed_at=self.now-6)})
+        stale = self.read({'health':health(1, observed_at=self.now-6)},scanning=True)
         self.assertFalse(stale['health_locked'])
         self.now += 1
-        locked = self.read({'health':health(24.99)})
+        locked = self.read({'health':health(24.99)},scanning=True)
         self.assertTrue(locked['health_locked'])
         self.assertEqual(locked['capital_metrics']['health']['percent'],24.99)
         self.assertEqual(locked['health_unlock_at'],self.engine.state()['entry_day']['end'])
         self.now += 1
-        self.assertTrue(self.read({'health':health(100)})['health_locked'])
+        self.assertTrue(self.read({'health':health(100)},scanning=True)['health_locked'])
         self.now = locked['health_unlock_at']
         self.assertFalse(self.read()['health_locked'])
-        self.assertTrue(self.read({'health':health(0)})['health_locked'])
+        self.assertTrue(self.read({'health':health(0)},scanning=True)['health_locked'])
 
-    def test_low_health_cancels_queued_or_unsubmitted_entry_without_revoking_execution(self):
+    def test_only_scan_and_confirmed_close_lock_and_monitor_never_delivers(self):
         tab_url = 'https://next.vestmarkets.com/trade/NQ-PERP'
         rows = [dict(name=name,category='eval',current=False,balance=5000,equity=5000,
                      unrealized_pnl=0,observed_at=self.now) for name in ('Alpha','Beta')]
@@ -89,22 +97,43 @@ class CapitalMetricsTests(unittest.TestCase):
         self.engine.settings({'mode':'browser'})
         self.engine.place_orders(dict(account_ids=[a['id'] for a in accounts],side='buy',symbol='NQ-PERP',
             quantity=4,take_profit=200,stop_loss=130,idempotency_key='test-health-lock'))
-        for i,account in enumerate(accounts):
-            identity = dict(account_id=account['id'],session_id=session['session_id'],mode_epoch=1,identity=account['identity'])
-            snapshot = dict(balance=5000,equity=5000,unrealized_pnl=0,price=28000,
-                            position_open=False,observed_at=self.now,account_health=25 if i else 24)
-            job = self.engine.bridge_poll({**identity,'tab_url':tab_url,'ready':True,'snapshot':snapshot})['job']
-            if not i:
-                self.assertIsNone(job)
-            else:
-                self.assertEqual(job['status'],'delivered')
-                self.now += 1
-                skipped = self.engine.bridge_result({**identity,'job_id':job['id'],'success':False,'confirmed':False,
-                    'skip_reason':'account_health','snapshot':{**snapshot,'account_health':24,'observed_at':self.now}})
-                self.assertEqual(skipped['status'],'cancelled')
-            with self.assertRaisesRegex(ValidationError,'健康度锁定'):
-                self.engine._eligible(account['id'])
-            self.assertFalse(self.engine._daily_entry_used(account['id']))
+        snapshot = dict(balance=5000,equity=5000,unrealized_pnl=0,price=28000,
+                        position_open=False,observed_at=self.now,account_health=24)
+        rows[0].update(scan_status='success',phase_snapshot=snapshot)
+        self.engine.bridge_session({**session,'authorize':False,'progress':{'completed':1,'total':2}})
+        alpha, beta = (self.engine.data['accounts'][a['id']] for a in accounts)
+        with self.assertRaisesRegex(ValidationError,'健康度锁定'):
+            self.engine._eligible(alpha['id'])
+        self.assertFalse(self.engine._daily_entry_used(alpha['id']))
+        self.assertFalse(self.engine._pending(alpha['id']))
+
+        request = dict(account_id=beta['id'],session_id=session['session_id'],mode_epoch=1,
+                       identity=beta['identity'],tab_url=tab_url,ready=True)
+        self.assertIsNone(self.engine.bridge_poll({**request,'snapshot':snapshot},dispatch=False)['job'])
+        self.assertEqual(self.engine._pending(beta['id'])[0]['status'],'queued')
+        job = self.engine.bridge_poll({**request,'snapshot':snapshot})['job']
+        self.assertEqual(job['status'],'delivered')
+        opened = {**snapshot,'position_open':True,'symbol':'NQ-PERP','position_id':'health-position',
+                  'side':'buy','quantity':4,'entry_price':28000}
+        self.assertEqual(self.engine.bridge_result({**request,'job_id':job['id'],'success':True,
+            'confirmed':True,'snapshot':opened})['status'],'confirmed')
+        self.assertFalse(self.engine._health_locked(beta))
+
+        protected = {**opened,'unrealized_pnl':-130,'equity':4870}
+        self.assertIsNone(self.engine.bridge_poll({**request,'snapshot':protected},dispatch=False)['job'])
+        self.assertFalse(self.engine._health_locked(beta))
+        closing = self.engine._pending(beta['id'])[0]
+        self.assertEqual((closing['type'],closing['status']),('close','queued'))
+        routed = self.engine.bridge_session({**session,'authorize':False})['next_account']
+        self.assertEqual((routed['id'],routed['operation']),(beta['id'],'close'))
+
+        # The native order closed before the queued fallback was dispatched.
+        closed = {**snapshot,'balance':4870,'equity':4870,'account_health':20}
+        for _ in range(2):
+            self.assertIsNone(self.engine.bridge_poll({**request,'snapshot':closed},dispatch=False)['job'])
+        self.assertEqual(closing['status'],'cancelled')
+        self.assertEqual(len(self.engine.data['history']),1)
+        self.assertEqual(beta['capital_metrics']['health']['percent'],20)
         self.assertEqual(self.engine.data['execution_sessions'][session['session_id']]['mode'],'execute')
         self.assertFalse(self.engine.data['positions'])
         for account in self.engine.state()['accounts']:

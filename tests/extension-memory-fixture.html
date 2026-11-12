@@ -27,7 +27,7 @@
         if(m.accounts.some(a=>a.name==='Alpha'&&a.category==='closed'))retired=true;
         return reply({});
       }
-      if(m.type==='poll'){counts.polls++;return reply({job:null});}
+      if(m.type==='monitor'){counts.polls++;return reply({job:null});}
       if(m.type==='execution-failed')throw new Error('Unexpected execution failure: '+m.error);
       throw new Error('Fixture rejects message '+m.type);
     }},storage:{local:{get:async()=>({}),set:async()=>{}},onChanged:event(changes)}}});

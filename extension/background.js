@@ -188,8 +188,9 @@ async function sessionRequest(tabId, options = {}) {
   const tab = await targetTab(tabId);
   const result = await localRequest('/api/bridge/session', {
     session_id: observation.session_id, mode: state.mode, mode_epoch: state.mode_epoch,
-    tab_url: tab.url, accounts: observation.accounts || [],
+    tab_url: tab.url, accounts: options.accounts ?? observation.accounts ?? [],
     ...(options.current_account ? { current_account: options.current_account } : {}),
+    ...(options.progress ? { progress: options.progress } : {}),
     heartbeat_only: !!options.heartbeat_only,
     ...(state.revocation_source ? { revocation_source: state.revocation_source } : {}),
     ...((options.execution_error || state.execution_error) ? {execution_error:String(options.execution_error || state.execution_error).slice(0,500)} : {}),
@@ -585,7 +586,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
         const latest = await chrome.storage.local.get(observationKey);
         await chrome.storage.local.set({ [observationKey]: { ...latest[observationKey], enabled: false } });
       }
-      return await checkedSession(sender.tab.id, state, { heartbeat_only: true }, () =>
+      return await checkedSession(sender.tab.id, state, { heartbeat_only: true, accounts, progress }, () =>
         localRequest('/api/bridge/observe', { tab_url: sender.url, accounts, error: message.error || '', progress }, observation.token));
     }
     if (message.type === 'accounts') {
@@ -648,7 +649,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
         session_id:observation.session_id,mode_epoch:state.mode_epoch,identity:account.identity,phase:account.phase,
         snapshot:message.snapshot,target_price:message.target_price,tab_url:sender.url},observation.token);
     }
-    if (message.type === 'poll' || message.type === 'result') {
+    if (message.type === 'poll' || message.type === 'monitor' || message.type === 'result') {
       if (!sender.tab || !sender.url?.startsWith('https://next.vestmarkets.com/trade/')) throw new Error('必须在 Vest 交易标签页运行');
       const key = 'tab:' + sender.tab.id;
       const stored = await chrome.storage.local.get(key);
@@ -657,23 +658,33 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
         const observation = await observationConfig(sender.tab.id);
         const state = await controlState(sender.tab.id);
         if (message.session_id !== observation.session_id) throw new Error('页面账户会话不匹配');
-        if (message.type === 'poll') {
+        if (message.type === 'poll' || message.type === 'monitor') {
           if (state.mode !== 'execute' || message.mode_epoch !== state.mode_epoch) return { job: null, mode: state.mode, mode_epoch: state.mode_epoch };
           const health = await connectionHealth(sender.tab.id);
           if (health?.mode_epoch === state.mode_epoch && health.blocked) return {job:null, ...state, ...connectionFields(health)};
           const account = observation.registrations?.find(account => account.id === message.account_id && account.identity === message.identity);
           if (!account) throw new Error('账户尚未自动识别或名称已变化');
           if (account.execution_excluded) throw new Error('主账户永久排除所有执行');
-          return await localRequest('/api/bridge/poll', {
+          const body = {
             account_id: account.id, session_id: observation.session_id, mode_epoch: state.mode_epoch,
             identity: account.identity, phase:message.phase,snapshot: message.snapshot, ready: message.ready === true, tab_url: sender.url,
-          }, observation.token);
+          };
+          if (message.type === 'monitor') {
+            try {
+              return await checkedExecutionRead(sender.tab.id, state, () => localRequest('/api/bridge/monitor', body, observation.token));
+            } catch (error) {
+              await stopExecution(sender.tab.id, state, error);
+              throw error;
+            }
+          }
+          return await localRequest('/api/bridge/poll', body, observation.token);
         }
         // Delivered actions retain their original epoch for reconciliation after a switch to read-only.
         return await localRequest('/api/bridge/result', {
           ...message.result, account_id: message.account_id, session_id: observation.session_id, mode_epoch: message.mode_epoch,
         }, observation.token);
       }
+      if (message.type === 'monitor') throw new Error('持仓监控需要有效的插件会话');
       if (!config?.token || !config.accountId || !config.enabled) return { job: null };
       if (message.type === 'poll') {
         const status = {

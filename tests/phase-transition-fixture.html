@@ -26,7 +26,7 @@
       }
       return reply({});
     }
-    if(message.type==='poll'){
+    if(message.type==='monitor'){
       if(message.phase!==account.phase || message.snapshot.phase!==account.phase)throw new Error('A stale-phase poll escaped');
       return reply({job:null});
     }
@@ -43,7 +43,7 @@
       document.getElementById('phase-badge').textContent=label;
       await state.timer();
       assert(account.phase===phase,'Account phase did not advance to '+phase);
-      const poll=state.messages.filter(m=>m.type==='poll').at(-1);
+      const poll=state.messages.filter(m=>m.type==='monitor').at(-1);
       assert(poll?.phase===phase&&poll.snapshot.phase===phase,'Current phase was not polled');
       assert(!state.messages.some(m=>m.type==='execution-failed'),'Phase change revoked execution');
     }

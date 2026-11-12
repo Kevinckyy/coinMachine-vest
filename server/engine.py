@@ -582,7 +582,8 @@ class Engine(PhaseAccounting, ProfitClaims):
             or reading.get('category') != account.get('category')
             or account.get('status') != 'active' or not account.get('enabled')
             or execution_excluded(account) or account.get('archived') or account.get('retired_failed')
-            or account.get('ambiguous') or self._health_locked(account)):
+            or account.get('ambiguous') or self._health_locked(account)
+            or self._position(account['id'])):
             return
         day = entry_day_window(reading['observed_at'])
         if not day['start'] <= self.clock() < day['end']:
@@ -590,11 +591,11 @@ class Engine(PhaseAccounting, ProfitClaims):
         account['health_unlock_at'] = day['end']
         reason = f"账户健康度 {reading['percent']:g}% 低于 {self.MIN_ACCOUNT_HEALTH}%，当日锁定"
         self._exclude_queued_entries(account['id'], reason, all_opens=True)
-        self._log('warning', f"{account['name']} {reason}，已有持仓继续保护")
+        self._log('warning', f"{account['name']} {reason}")
 
     def _observe_snapshot_health(self, account, snapshot):
         percent = snapshot.get('account_health')
-        if percent is None or snapshot.get('phase') != account.get('phase'):
+        if percent is None or snapshot.get('position_open') is not False or snapshot.get('phase') != account.get('phase'):
             return
         metrics = account.setdefault('capital_metrics', {})
         previous = metrics.get('health') or {}
@@ -603,7 +604,7 @@ class Engine(PhaseAccounting, ProfitClaims):
                        phase=account.get('phase'), source='vest-page', update_pending=False)
         if snapshot['observed_at'] >= previous.get('observed_at', 0):
             metrics['health'] = reading
-        self._lock_low_health(account, reading)
+            self._lock_low_health(account, reading)
 
     def strategy_lock_account(self, aid, locked):
         with self.lock:
@@ -1696,6 +1697,7 @@ class Engine(PhaseAccounting, ProfitClaims):
                                 'error':body.get('error',''),'progress':body.get('progress')}
             self.observe_accounts(observation_body)
             rows = self.data['read_only_observation']['accounts']
+            scanning = self.data['read_only_observation']['progress'] is not None
             names = {}
             for row in rows:
                 names[row['name']] = names.get(row['name'],0)+1
@@ -1705,7 +1707,7 @@ class Engine(PhaseAccounting, ProfitClaims):
             old_ids = set(session['account_ids'])
             ids = []
             account_phases={}
-            for row in rows:
+            for raw, row in zip(body.get('accounts',[]), rows):
                 matches = [a for a in self.data['accounts'].values() if a.get('auto_discovered') and not a.get('merged_into')
                     and a['name']==row['name']]
                 if len(matches)>1:
@@ -1784,8 +1786,11 @@ class Engine(PhaseAccounting, ProfitClaims):
                     account['lock_reason'] = '平台账户状态为 '+row['category']
                 self._enforce_retired_failure(account)
                 self._enforce_archived_account(account)
-                if not account['ambiguous']:
-                    self._lock_low_health(account, account.get('capital_metrics', {}).get('health'))
+                proof = row.get('phase_snapshot') or {}
+                if (scanning and raw.get('scan_status')=='success' and account.get('session_id')==sid
+                    and abs(now-proof.get('observed_at',0))<=5
+                    and not any(j['status'] in ('delivered','unknown') for j in self._pending(aid))):
+                    self._observe_snapshot_health(account, proof)
                 row['account_id'] = aid if not account['ambiguous'] else None
                 row['account_scope'] = scope
                 row['auto_discovered'] = True
@@ -1887,7 +1892,7 @@ class Engine(PhaseAccounting, ProfitClaims):
             self._save()
             return {'ok':True,'read_only':True,'account_id':account['id'],'position_open':snapshot['position_open']}
 
-    def bridge_poll(self, body):
+    def bridge_poll(self, body, *, dispatch=True):
         with self.lock:
             aid = body.get('account_id')
             account = self._account(aid)
@@ -1896,8 +1901,18 @@ class Engine(PhaseAccounting, ProfitClaims):
             self._exclude_primary_account(account)
             self._expire_execution_sessions()
             self._execution_identity(body,account)
+            reply = {'job':None,'mode':self.data['mode']}
+            if not dispatch:
+                # This route can save observations and queue protection. It
+                # cannot reserve or return a job, even if the response is lost.
+                if not account.get('auto_discovered'):
+                    raise ValidationError('持仓监控需要有效的插件会话',409)
+                lease = self.data['execution_sessions'][account['session_id']]
+                reply.update(mode=lease['mode'],mode_epoch=lease['mode_epoch'])
+                if lease['mode']!='execute':
+                    return reply
             if account.get('phase_pending'):
-                return {'job':None,'phase_sync_pending':True,'mode':self.data['mode']}
+                return {**reply,'phase_sync_pending':True}
             parsed = urlparse(str(body.get('tab_url', '')))
             if parsed.scheme != 'https' or parsed.hostname != 'next.vestmarkets.com':
                 raise ValidationError('只允许连接 https://next.vestmarkets.com 页面')
@@ -1910,7 +1925,6 @@ class Engine(PhaseAccounting, ProfitClaims):
                 session.update({'session_id':account['session_id'],'identity':account['identity'],'mode_epoch':body['mode_epoch']})
             self.data['bridge_sessions'][aid] = session
             if self._fresh(aid):
-                self._observe_snapshot_health(account, snapshot)
                 if snapshot.get('symbol') == 'NQ-PERP':
                     self._observe_browser_price(snapshot)
                 account['balance'] = snapshot['balance']
@@ -1925,7 +1939,7 @@ class Engine(PhaseAccounting, ProfitClaims):
                         if not self._matches_position(position, snapshot):
                             self._freeze(aid, f"{account['name']} 持仓标识、方向或数量变化，请到 Vest 人工核对")
                             self._save()
-                            return {'job': None, 'server_time': self.clock(), 'mode': self.data['mode']}
+                            return {**reply,'server_time':self.clock()}
                         position['unrealized_pnl'] = snapshot['unrealized_pnl']
                         position['mark_price'] = snapshot['price']
                         if position['status']=='open' and not self._pending(aid) and self._ready(aid):
@@ -1956,11 +1970,10 @@ class Engine(PhaseAccounting, ProfitClaims):
                 self.data['strategy']['status'] = 'paused'
                 self.data['strategy']['next_action_at'] = None
                 self._log('error', f"{account['name']} 读数不完整或未启用桥接，策略暂停")
-            job = None
-            actor_busy = account.get('auto_discovered') and any(
+            actor_busy = dispatch and account.get('auto_discovered') and any(
                 j.get('session_id')==account['session_id'] and j['status'] in ('delivered','unknown')
                 for j in self.data['jobs'].values())
-            if self.data['mode']=='browser' and self._ready(aid) and not actor_busy:
+            if dispatch and self.data['mode']=='browser' and self._ready(aid) and not actor_busy:
                 for candidate in self.data['jobs'].values():
                     if candidate['account_id'] != aid or candidate['status']!='queued':
                         continue
@@ -2010,10 +2023,10 @@ class Engine(PhaseAccounting, ProfitClaims):
                     candidate['status'] = 'delivered'
                     candidate['delivered_at'] = self.clock()
                     candidate['balance_before'] = snapshot['balance']
-                    job = copy.deepcopy(candidate)
+                    reply['job'] = copy.deepcopy(candidate)
                     break
             self._save()
-            return {'job': job, 'server_time': self.clock(), 'mode': self.data['mode']}
+            return {**reply,'server_time':self.clock()}
 
     def _finish_browser_close(self, position, snapshot, reason):
         account = self._account(position['account_id'])
@@ -2030,6 +2043,7 @@ class Engine(PhaseAccounting, ProfitClaims):
         account['realized_pnl'] = round(account['balance']-account['initial_balance'], 2)
         del self.data['positions'][position['id']]
         self._account_status(account)
+        self._observe_snapshot_health(account, snapshot)
         self._lock_strategy_exit(position,reason,pnl)
         self._queue_profit_claim(position,trade,snapshot)
         self._log('info', f"{account['name']} 平仓已观察确认，余额变化 {pnl:+.2f} USDC")
@@ -2063,7 +2077,6 @@ class Engine(PhaseAccounting, ProfitClaims):
                 or abs(self.clock()-snapshot['observed_at'])>5
                 or any(snapshot.get(k) is None for k in ('balance','unrealized_pnl','price')) or snapshot['price']<=0):
                 raise ValidationError('确认仓位大小需要新鲜且明确空仓的页面读数',409)
-            self._observe_snapshot_health(account, snapshot)
             if self._health_locked(account):
                 self._save()
                 return {'ok':True, 'job_id':job['id'], 'skip_reason':'account_health'}
@@ -2171,8 +2184,7 @@ class Engine(PhaseAccounting, ProfitClaims):
                     or body.get('success') is not False or body.get('confirmed') is not False
                     or (health >= self.MIN_ACCOUNT_HEALTH and not self._health_locked(account))):
                     raise ValidationError('健康度跳过回执缺少原账户的新鲜空仓证明',409)
-                self._observe_snapshot_health(account, snapshot)
-                job.update(status='cancelled', skip_reason='account_health', cancel_reason='开仓提交前触发账户健康度锁定')
+                job.update(status='cancelled', skip_reason='account_health', cancel_reason='插件因账户健康度跳过开仓')
                 self._save()
                 return {'ok':True, 'status':'cancelled'}
             if expected:
@@ -2187,7 +2199,6 @@ class Engine(PhaseAccounting, ProfitClaims):
                 self._freeze(job['account_id'], f"浏览器操作结果未确认：{job['error']}；不自动重试，请到 Vest 核对。")
                 self._save()
                 return {'ok': False, 'status': 'unknown', 'error': job['error']}
-            self._observe_snapshot_health(account, snapshot)
             session = self.data['bridge_sessions'].get(account['id'], {})
             previous = session.get('snapshot', {})
             if job['type']=='open':

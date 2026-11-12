@@ -34,10 +34,12 @@ async function until(action, label, timeout = 15000) {
 const uploads = [];
 const sessionRequests = [];
 const pollRequests = [];
+const monitorRequests = [];
 const jobResults = [];
 const executionSessions = new Map();
 let queuedOpen = null;
 let monitorAccount = false;
+let monitorUnavailable = false;
 let observationGate = null;
 let serviceUnavailable = false;
 let cancelledJobDeliveries = 0;
@@ -108,6 +110,14 @@ const api = createServer(async (request, response) => {
       cancelledJobDeliveries++;
     }
     return send(200, { job, mode: 'browser', server_time: Date.now() / 1000 });
+  }
+  if (request.url === '/api/bridge/monitor' && request.method === 'POST') {
+    let raw = '';
+    for await (const chunk of request) raw += chunk;
+    const body = JSON.parse(raw);
+    monitorRequests.push(body);
+    if (monitorUnavailable) return request.socket.destroy();
+    return send(200, { job: null, ...executionSessions.get(body.session_id) });
   }
   if (request.url === '/api/bridge/size' && request.method === 'POST') {
     let raw=''; for await(const chunk of request) raw+=chunk;
@@ -210,12 +220,13 @@ let browser, browserCDP;
 const connections = [];
 try {
   await cp(path.join(root, 'extension'), extensionDir, { recursive: true });
-  const backgroundPath = path.join(extensionDir, 'background.js');
-  const originalBackground = await readFile(backgroundPath, 'utf8');
+  const workerFile = 'vest-smoke-background.js';
+  const originalBackground = await readFile(path.join(extensionDir, 'background.js'), 'utf8');
   assert.ok(originalBackground.includes("const ENDPOINT = 'http://127.0.0.1:8765';"), 'test must redirect the copied endpoint away from the user service');
-  await writeFile(backgroundPath, originalBackground.replace("const ENDPOINT = 'http://127.0.0.1:8765';", `const ENDPOINT = '${endpoint}';`));
+  await writeFile(path.join(extensionDir, workerFile), originalBackground.replace("const ENDPOINT = 'http://127.0.0.1:8765';", `const ENDPOINT = '${endpoint}';`));
   const manifestPath = path.join(extensionDir, 'manifest.json');
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  manifest.background.service_worker = workerFile;
   manifest.host_permissions.push(endpoint + '/*');
   await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
   browser = spawn(edge, ['--headless=new', '--disable-gpu', '--no-first-run', '--disable-background-networking', '--disable-component-update', '--disable-default-apps', '--disable-sync', '--remote-debugging-port=0', '--user-data-dir=' + profileDir, '--disable-extensions-except=' + extensionDir, '--load-extension=' + extensionDir, 'about:blank'], { windowsHide: true, stdio: 'ignore' });
@@ -223,7 +234,7 @@ try {
   const debugBase = 'http://127.0.0.1:' + Number(debugging[0]);
   browserCDP = await CDP.open('ws://127.0.0.1:' + Number(debugging[0]) + debugging[1]);
   const targets = async () => (await browserCDP.command('Target.getTargets')).targetInfos;
-  const worker = await until(async () => (await targets()).find((target) => target.type === 'service_worker' && /^chrome-extension:\/\/[a-p]+\/background\.js$/.test(target.url)), 'real unpacked MV3 service worker (this browser may disallow --load-extension)', 12000);
+  const worker = await until(async () => (await targets()).find((target) => target.type === 'service_worker' && target.url.endsWith('/' + workerFile)), 'real unpacked MV3 service worker (this browser may disallow --load-extension)', 12000);
   const extensionId = new URL(worker.url).hostname;
   const connectTarget = async (targetId) => {
     const target = await until(async () => (await (await fetch(debugBase + '/json/list')).json()).find((item) => item.id === targetId), 'target WebSocket');
@@ -347,7 +358,18 @@ try {
   assert.equal(enabled.data.mode, 'execute');
   assert.equal(await popup.evaluate(`chrome.storage.local.get('observation:'+${tabId}).then(result=>result['observation:'+${tabId}].registrations.length)`), 3, 'scanning automatically registers accounts without a manual binding');
   assert.ok(sessionRequests.some(item => item.mode === 'execute' && item.authorize === true), 'only the explicit toggle authorizes execution');
-  await until(() => pollRequests.some(item => item.account_id === 'auto-alpha' && item.ready === true), 'automatic account selection, preparation and fresh dispatch poll', 15000);
+  await until(() => monitorRequests.some(item => item.account_id === 'auto-alpha' && item.ready === true), 'automatic account selection and first monitoring snapshot');
+  const pollsBeforeMonitorFailure = pollRequests.length;
+  monitorUnavailable = true;
+  await until(async()=>{const status=(await call({type:'control-status',tabId})).data;
+    return status?.connection_pending && status.connection_error.includes('/api/bridge/monitor');}, 'a monitoring-only fetch failure enters the connection hold');
+  monitorUnavailable = false;
+  const beforeMonitorRecovery = monitorRequests.length;
+  await until(()=>monitorRequests.length>beforeMonitorRecovery,'monitoring resumes after the connection hold');
+  const afterMonitorFailure = (await call({type:'control-status',tabId})).data;
+  assert.equal(afterMonitorFailure.mode,'execute');
+  assert.equal(afterMonitorFailure.mode_epoch,enabled.data.mode_epoch);
+  assert.equal(pollRequests.length,pollsBeforeMonitorFailure,'monitor recovery never polls an order');
   preparationPlan={active:true,run_id:'legacy-run',plan_id:'legacy-plan',accounts:[automaticAccounts[1]]};
   const beforeRetired=sessionRequests.length;
   await until(()=>sessionRequests.length>beforeRetired+2,'normal heartbeats ignore retired preparation plans');
@@ -416,10 +438,10 @@ try {
   // A flat passed account remains observable in execute mode even when Vest
   // removes the opening form. This must not stop other accounts in the session.
   await vestPage.evaluate(`document.querySelector('[data-testid="order-form"]').remove()`);
-  const passedPollStart = pollRequests.length;
+  const passedPollStart = monitorRequests.length;
   await until(() => popup.evaluate(`!document.getElementById('modeSwitch').checked && !document.getElementById('modeSwitch').disabled`), 'read-only switch settles after the cancelled job');
   await popup.evaluate(`document.getElementById('modeSwitch').click()`);
-  await until(() => pollRequests.slice(passedPollStart).some(item => item.account_id==='auto-alpha' && item.identity==='passed:QA Alpha' && item.ready===false), 'execute mode reconciles a flat passed account without preparing an opening form');
+  await until(() => monitorRequests.slice(passedPollStart).some(item => item.account_id==='auto-alpha' && item.identity==='passed:QA Alpha' && item.ready===false), 'execute mode reconciles a flat passed account without preparing an opening form');
   assert.equal((await call({ type:'control-status',tabId })).data.mode,'execute', 'observing a passed account must not revoke the entire session');
   await until(() => popup.evaluate(`document.getElementById('modeSwitch').checked && !document.getElementById('modeSwitch').disabled`), 'passed-account observation is active');
   await popup.evaluate(`document.getElementById('modeSwitch').click()`);
