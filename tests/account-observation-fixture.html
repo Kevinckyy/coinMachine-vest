@@ -5,6 +5,8 @@
 <p data-testid="account-value">$987.50</p><p data-testid="account-upnl">-$12.50</p>
 <div class="sticky top-14" id="capital-banner"><p id="capital-goal">Step Goal: <span>$0.00 / $80.00</span></p><div>Max. Daily Loss <p data-testid="capital-indicator-daily-loss">$12.50 / $40.00</p></div><p id="capital-drawdown"><span>Max. Drawdown</span>: $12.50 / $100.00</p></div>
 <div style="display:none"><p data-testid="capital-indicator-goal">$8,000.00 / $9,000.00</p></div>
+<div id="account-health">账户健康度 <p data-testid="account-health">90%</p></div>
+<div style="display:none"><p data-testid="account-health">0%</p></div>
 <button data-testid="submit-long">Forbidden trading button</button>
 <pre id="fixture-result"></pre>
 <script>
@@ -24,6 +26,8 @@
   const pnl = document.querySelector('[data-testid="account-upnl"]');
   const capital = document.getElementById('capital-banner');
   function renderMetrics(account) {
+    document.querySelector('#account-health [data-testid="account-health"]').textContent =
+      ({alpha:'90%',beta:'24%'})[account.key] || '—';
     const daily=capital.querySelector('[data-testid="capital-indicator-daily-loss"]');daily.textContent=account.daily||'—';
     document.getElementById('capital-goal').innerHTML='Step Goal: <span>'+(account.goal||'—')+'</span>';
     document.getElementById('capital-drawdown').innerHTML='<span>Max. Drawdown</span>: '+(account.drawdown||'—');
@@ -101,6 +105,7 @@
       const beta=scanned.accounts.find(account=>account.name==='Beta').capital_metrics;
       assert(alpha.daily_loss.current===12.5&&alpha.daily_loss.limit===40&&alpha.drawdown.limit===100&&alpha.goal.limit===80,'Alpha metrics were missing or taken from a hidden widget');
       assert(beta.daily_loss.percent===3&&beta.drawdown.limit===120&&beta.goal===null,'Beta inherited Alpha amounts or invented a goal');
+      assert(alpha.health.percent===90&&beta.health.percent===24,'Health was not read from each selected account');
       assert(state.pollCalls===0&&state.tradeClicks===0,'Metric scan entered execution');
     });
     await test('Chinese top-left labels work without goal and drawdown test ids',async()=>{

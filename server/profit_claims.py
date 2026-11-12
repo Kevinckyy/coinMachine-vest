@@ -53,7 +53,8 @@ class ProfitClaims:
     def _schedule_claim_reentry(self, claim):
         s=self.data['strategy'];a=self._account(claim['account_id'])
         if (claim.get('reentry_scheduled') or s['status'] not in self.ACTIVE or s.get('run_id')!=claim['run_id']
-            or a['id'] not in s.get('batch_account_ids',[]) or a.get('strategy_locked') or a.get('status')!='active'):
+            or a['id'] not in s.get('batch_account_ids',[]) or a.get('strategy_locked') or self._health_locked(a)
+            or a.get('status')!='active'):
             return
         if a['id'] not in s['order_queue']:s['order_queue'].append(a['id'])
         s.update(phase='submitting',next_action_at=self.clock()+self.rng.uniform(s['config']['order_delay_min'],s['config']['order_delay_max']))

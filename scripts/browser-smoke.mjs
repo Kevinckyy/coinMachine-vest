@@ -236,7 +236,11 @@ try {
   const sessionBody = (mode, modeEpoch, authorize = false) => ({
     session_id: 'qa-auto-session', mode, mode_epoch: modeEpoch, authorize,
     tab_url: 'https://next.vestmarkets.com/trade/NQ-PERP', accounts: [
-      { capital_metrics: Object.fromEntries([['daily_loss',12.5,130],['drawdown',20,500],['goal',60,300]].map(([key,current,limit]) => [key,{text:`$${current} / $${limit}`,current,limit,percent:null,observed_at:Date.now()/1000-observationAge}])), name: 'QA Observed Account', category: 'eval', identity: 'eval:QA Observed Account', equity: 987.5, balance: 1000, unrealized_pnl: -12.5, current: true, observed_at: Date.now() / 1000 - observationAge },
+      { capital_metrics: {
+        ...Object.fromEntries([['daily_loss',12.5,130],['drawdown',20,500],['goal',60,300]].map(([key,current,limit]) =>
+          [key,{text:`$${current} / $${limit}`,current,limit,percent:null,observed_at:Date.now()/1000-observationAge}])),
+        health: {text:'96%',current:null,limit:null,percent:96,observed_at:Date.now()/1000-observationAge},
+      }, name: 'QA Observed Account', category: 'eval', identity: 'eval:QA Observed Account', equity: 987.5, balance: 1000, unrealized_pnl: -12.5, current: true, observed_at: Date.now() / 1000 - observationAge },
       { name: 'QA Unknown Account', category: 'funded', identity: 'funded:QA Unknown Account', equity: null, balance: null, unrealized_pnl: null, current: false, observed_at: null },
     ],
   });
@@ -269,11 +273,11 @@ try {
   assert.equal(await evaluate(`(() => { const row=[...document.querySelectorAll('#vest-page-accounts tbody tr')].find(row=>row.textContent.includes('QA Unknown Account')); return row && [...row.querySelectorAll('td.numeric:not(.daily-realized-pnl):not(.capital-metric-cell):not(.phase-realized-pnl)')].length === 3 && [...row.querySelectorAll('td.numeric:not(.daily-realized-pnl):not(.capital-metric-cell):not(.phase-realized-pnl)')].every(cell=>cell.textContent.trim()==='—'); })()`), true, 'unknown account financial fields stay unknown');
   await until(()=>evaluate(`[...document.querySelectorAll('#vest-page-accounts tbody tr')].some(row=>row.textContent.includes('QA Observed Account') && row.textContent.includes('1,000.00') && row.textContent.includes('待更新'))`),'expired account keeps its last amounts with a pending-update marker');
   assert.equal(await evaluate(`document.querySelectorAll('#vest-page-accounts th.daily-pnl-heading').length`),1,'account table includes daily realized PnL with the trading-day cutoff');
-  await until(()=>evaluate(`(() => { const row=document.querySelector('[aria-label="选择 QA Observed Account"]')?.closest('tr');return row && row.querySelectorAll('.capital-metric-cell').length===3 && row.textContent.includes('12.50 / 130.00') && row.textContent.includes('20.00 / 500.00') && row.textContent.includes('60.00 / 300.00') && [...row.querySelectorAll('.capital-metric-cell')].every(cell=>cell.textContent.includes('待更新'));})()`),'three capital metrics retain stale values with pending labels');
+  await until(()=>evaluate(`(() => { const row=document.querySelector('[aria-label="选择 QA Observed Account"]')?.closest('tr');return row && row.querySelectorAll('.capital-metric-cell').length===4 && row.textContent.includes('12.50 / 130.00') && row.textContent.includes('20.00 / 500.00') && row.textContent.includes('60.00 / 300.00') && row.textContent.includes('96.00%') && [...row.querySelectorAll('.capital-metric-cell')].every(cell=>cell.textContent.includes('待更新'));})()`),'account metrics including health retain stale values with pending labels');
   observationAge = 0;
   const executingSession = await updatePluginMode('execute', 1, true);
   assert.equal(executingSession.mode, 'execute');
-  await until(()=>evaluate(`[...document.querySelectorAll('#vest-page-accounts th')].filter(th=>['最大日亏损','最大回撤','阶段目标'].some(label=>th.textContent.includes(label))).length===3 && [...document.querySelector('[aria-label="选择 QA Observed Account"]').closest('tr').querySelectorAll('.capital-metric-cell')].every(cell=>!cell.textContent.includes('待更新'))`),'new capital readings clear individual pending markers');
+  await until(()=>evaluate(`[...document.querySelectorAll('#vest-page-accounts th')].filter(th=>['最大日亏损','最大回撤','阶段目标','账户健康度'].some(label=>th.textContent.includes(label))).length===4 && [...document.querySelector('[aria-label="选择 QA Observed Account"]').closest('tr').querySelectorAll('.capital-metric-cell')].every(cell=>!cell.textContent.includes('待更新'))`),'new capital readings clear individual pending markers');
   assert.equal(executingSession.accounts.find(account => account.name === 'QA Observed Account').executable, true);
   assert.equal(executingSession.accounts.find(account => account.name === 'QA Unknown Account').executable, false, 'an unread account remains unavailable in execution mode');
   await until(() => evaluate(`document.querySelector('[aria-label="选择 QA Observed Account"]')?.disabled === false`), 'plugin execute mode enables the automatically discovered account');

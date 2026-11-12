@@ -1,7 +1,8 @@
 /* Operates only the public webpage DOM; never reads the website's credentials. */
 (() => {
   'use strict';
-  const VERSION = '0.3.28';
+  const VERSION = '0.3.29';
+  const MIN_ACCOUNT_HEALTH = 25;
   const CONTROLLER = '__vestControlBridgeController';
   // A previous injection may belong to a reloaded extension context. Retire it
   // instead of trusting a boolean marker that can outlive its message listener.
@@ -199,6 +200,7 @@
       equity,
       balance: equity !== null && pnl !== null ? Math.round((equity - pnl) * 100) / 100 : null,
       unrealized_pnl: pnl,
+      account_health: readAccountHealth()?.percent ?? null,
       price: numeric('price'),
       ...details,
       position_open: isOpen,
@@ -437,6 +439,7 @@
     const before = job.type === 'open' ? readyCheck() : assertAccount(false);
     if (job.type === 'open') {
       if (before.position_open !== false) throw new Error('账户已有持仓，不能重复开仓');
+      if (healthBlocksEntry(before)) return {...before, skip_reason:'account_health'};
       const oldIds = new Set([...document.querySelectorAll('[data-testid^="position-symbol-"]')]
         .map((el) => el.getAttribute('data-testid').slice('position-symbol-'.length)));
       if (job.size_percent === undefined) await setInput('quantity',core.nqVestToInput(job.quantity,config.inputUnit || 'token'));
@@ -449,10 +452,13 @@
           stopDecision = core.strategyStopLoss(job,observerCapitalMetrics().drawdown,config.phase);
           await setInput('stopLoss',stopDecision.stop_loss == null ? '' : stopDecision.stop_loss);
         }
+        const sizingSnapshot = readyCheck();
+        if (healthBlocksEntry(sizingSnapshot)) return {...sizingSnapshot, skip_reason:'account_health'};
         const sized = await call('size',{ job_id:job.id,account_id:config.accountId,session_id:executionSession,
-          mode_epoch:config.mode_epoch,identity:config.identity,size_percent:job.size_percent,quantity,snapshot:readyCheck(),
+          mode_epoch:config.mode_epoch,identity:config.identity,size_percent:job.size_percent,quantity,snapshot:sizingSnapshot,
           ...(job.skip_stop_loss_on_low_drawdown ? {stop_loss:stopDecision.stop_loss,drawdown:stopDecision.drawdown} : {}) });
         assertArmed(job);
+        if (sized.job_id===job.id && sized.skip_reason==='account_health') return {...readyCheck(), skip_reason:'account_health'};
         if (sized.job_id!==job.id || sized.size_percent!==job.size_percent || !core.sameQuantity(sized.quantity,quantity)) throw new Error('本地数量核验不一致，未提交订单');
         job = {...job,quantity};
         if (job.skip_stop_loss_on_low_drawdown) {
@@ -460,7 +466,9 @@
           job = {...job,stop_loss:sized.stop_loss,stop_loss_omitted:sized.stop_loss_omitted};
         }
       }
-      if (readyCheck().position_open !== false) throw new Error('下单前持仓状态变化');
+      const submitSnapshot = readyCheck();
+      if (submitSnapshot.position_open !== false) throw new Error('下单前持仓状态变化');
+      if (healthBlocksEntry(submitSnapshot)) return {...submitSnapshot, skip_reason:'account_health'};
       if (!core.sameQuantity(core.nqInputToVest(numeric('quantity'),config.inputUnit || 'token'),job.quantity)) throw new Error('提交前数量发生变化，未下单');
       if (job.size_percent !== undefined && Number(queryOne('[role="slider"]',mainForm(true),true).getAttribute('aria-valuenow'))!==job.size_percent) throw new Error('提交前仓位比例变化，未下单');
       if ((job.take_profit == null ? field('takeProfit',true).value.trim() !== '' : !core.sameQuantity(numeric('takeProfit'),job.take_profit)) ||
@@ -507,6 +515,18 @@
     return await awaitPosition(job, null, expectedPosition);
   }
 
+  function healthBlocksEntry(snapshot) {
+    return (Number.isFinite(snapshot.account_health) && snapshot.account_health < MIN_ACCOUNT_HEALTH) ||
+      sessionAccounts.some(account => account.id === config.accountId && account.health_unlock_at > Date.now() / 1000);
+  }
+
+  function executionResult(job, observed) {
+    const {skip_reason, ...snapshot} = observed;
+    const skipped = skip_reason === 'account_health';
+    return {job_id:job.id, success:!skipped, confirmed:!skipped, snapshot,
+      ...(skipped ? {skip_reason} : {})};
+  }
+
   async function call(type, data = {}) {
     assertLive();
     let result;
@@ -535,7 +555,7 @@
         let result;
         try {
           const observed = await execute(response.job);
-          result = { job_id: response.job.id, success: true, confirmed: true, snapshot: observed };
+          result = executionResult(response.job, observed);
         } catch (error) {
           lastDiagnostic = error.message;
           config.armed = false;
@@ -588,12 +608,20 @@
     const labels = [...trigger.querySelectorAll('span')].filter(el => visible(el) && (names.length !== 1 || !el.contains(names[0]))).map(el => core.normalized(el.textContent));
     core.assertExecutionAllowed({ name, category: core.accountCategory(labels) });
   }
+  function readAccountHealth() {
+    const indicators = [...document.querySelectorAll('[data-testid="account-health"]')].filter(el =>
+      visible(el) && !el.closest('[role="dialog"],[role="alertdialog"],[role="menu"],[aria-busy="true"],[data-loading="true"]'));
+    const readings = indicators.map(el => core.parseCapitalMetric(elementText(el)));
+    const first = readings[0];
+    return first?.percent != null && first.percent <= 100 && readings.every(item => item?.percent === first.percent) ? first : null;
+  }
+
   function observerCapitalMetrics() {
     let phase=null;try{phase=observerIdentity().phase;}catch{}
     const eligible = el => visible(el) && !el.closest('[role="dialog"],[role="alertdialog"],[role="menu"]');
     const banners = [...document.querySelectorAll('div.sticky.top-14')].filter(eligible);
     const observed_at = Date.now() / 1000;
-    return Object.fromEntries(core.CAPITAL_INDICATORS.map(({key,testId,labels}) => {
+    const metrics = Object.fromEntries(core.CAPITAL_INDICATORS.map(({key,testId,labels}) => {
       // Desktop's top-left banner omits the goal/drawdown test IDs. Read only
       // exact labels inside that banner; never search unrelated account cards.
       let sources = banners.flatMap(banner => {
@@ -612,6 +640,9 @@
       const consistent = first && readings.every(item => item && ['current','limit','percent'].every(field => item[field] === first[field]));
       return [key,consistent ? {...first,observed_at,...(phase?{phase}:{})} : null];
     }));
+    const health = readAccountHealth();
+    metrics.health = health ? {...health, observed_at, ...(phase ? {phase} : {})} : null;
+    return metrics;
   }
   function bannerUnrealized() {
     // The desktop second-row banner has no account-upnl test ID. Read its
@@ -711,7 +742,7 @@
       guard();
       try {
         const value = observerValues(name);
-        const loadingFields=monitoring ? '[data-testid="account-value"],[data-testid="account-upnl"]' : '[data-testid="account-value"],[data-testid="account-upnl"],[data-testid^="capital-indicator-"],div.sticky.top-14[aria-busy="true"],div.sticky.top-14 [aria-busy="true"],div.sticky.top-14[data-loading="true"],div.sticky.top-14 [data-loading="true"]';
+        const loadingFields=monitoring ? '[data-testid="account-value"],[data-testid="account-upnl"]' : '[data-testid="account-value"],[data-testid="account-upnl"],[data-testid="account-health"],[data-testid^="capital-indicator-"],div.sticky.top-14[aria-busy="true"],div.sticky.top-14 [aria-busy="true"],div.sticky.top-14[data-loading="true"],div.sticky.top-14 [data-loading="true"]';
         const pending = [...document.querySelectorAll(loadingFields)]
           .some((el) => visible(el) && el.closest('[aria-busy="true"],[data-loading="true"]'));
         if (pending) throw new Error('账户数据仍在加载');
@@ -1362,7 +1393,7 @@
         const observed = await execute(receivedJob);
         if (await reportCurrentTerminal(account.name)) return;
         await call('result', { account_id: account.id, session_id: executionSession, mode_epoch: epoch,
-          result: { job_id: receivedJob.id, success: true, confirmed: true, snapshot: observed } });
+          result: executionResult(receivedJob, observed) });
       } catch (error) {
         if (await advanceCompletedPhase(epoch, receivedJob)) return;
         if (await reportCurrentTerminal(account.name)) return;

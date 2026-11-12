@@ -99,7 +99,8 @@ def execution_excluded(account):
 class Engine(PhaseAccounting, ProfitClaims):
     ACTIVE = {'running', 'waiting'}
     UNRESOLVED = {'queued', 'delivered', 'unknown'}
-    CAPITAL_METRICS = ('daily_loss','drawdown','goal')
+    CAPITAL_METRICS = ('daily_loss','drawdown','goal','health')
+    MIN_ACCOUNT_HEALTH = 25
 
     def __init__(self, db_path='runtime/vest.sqlite', *, seed=True, clock=None, rng=None):
         self.db_path=str(db_path)
@@ -369,6 +370,9 @@ class Engine(PhaseAccounting, ProfitClaims):
             if canonical.get('balance') is not None and canonical.get('initial_balance') is not None:
                 canonical['realized_pnl'] = round(canonical['balance']-canonical['initial_balance'],2)
             canonical['enabled'] = all(a.get('enabled',True) for a in group)
+            health_unlock_at = max((a.get('health_unlock_at') or 0) for a in group)
+            if health_unlock_at:
+                canonical['health_unlock_at'] = health_unlock_at
             failed=next((a for a in group if a.get('retired_failed')),None)
             if failed:
                 canonical.update({k:failed.get(k) for k in ('retired_failed','failure_confirmed_at','failure_confirmation_source','failure_evidence','terminal_status')})
@@ -549,7 +553,10 @@ class Engine(PhaseAccounting, ProfitClaims):
             return
         account.update({'strategy_locked':True,'strategy_lock_reason':reason,
                         'strategy_lock_source':source,'strategy_locked_at':self.clock()})
-        aid = account['id']
+        self._exclude_queued_entries(account['id'], reason, all_opens=source=='evaluation_passed')
+        self._log('info',f"{account['name']} 已锁定自动策略：{reason}；已有持仓继续保护")
+
+    def _exclude_queued_entries(self, aid, reason, *, all_opens):
         strategy = self.data['strategy']
         strategy['remaining_accounts'] = [a for a in strategy.get('remaining_accounts',[]) if a != aid]
         strategy['order_queue'] = [a for a in strategy.get('order_queue',[]) if a != aid]
@@ -560,10 +567,43 @@ class Engine(PhaseAccounting, ProfitClaims):
             strategy['phase'] = 'monitoring'
             strategy['next_action_at'] = None
         for job in self.data['jobs'].values():
-            if job['account_id'] == aid and job['type']=='open' and job['status']=='queued' and (job.get('source')=='strategy' or source=='evaluation_passed'):
+            if job['account_id'] == aid and job['type']=='open' and job['status']=='queued' and (all_opens or job.get('source')=='strategy'):
                 job['status'] = 'cancelled'
                 job['cancel_reason'] = reason+'；已取消尚未派发的开仓'
-        self._log('info',f"{account['name']} 已锁定自动策略：{reason}；已有持仓继续保护")
+
+    def _health_locked(self, account):
+        return (account.get('health_unlock_at') or 0) > self.clock()
+
+    def _lock_low_health(self, account, reading):
+        if (not reading or reading.get('update_pending') or reading.get('percent') is None
+            or not 0 <= reading['percent'] < self.MIN_ACCOUNT_HEALTH
+            or abs(self.clock()-reading['observed_at']) > 5
+            or reading.get('phase') != account.get('phase')
+            or reading.get('category') != account.get('category')
+            or account.get('status') != 'active' or not account.get('enabled')
+            or execution_excluded(account) or account.get('archived') or account.get('retired_failed')
+            or account.get('ambiguous') or self._health_locked(account)):
+            return
+        day = entry_day_window(reading['observed_at'])
+        if not day['start'] <= self.clock() < day['end']:
+            return
+        account['health_unlock_at'] = day['end']
+        reason = f"账户健康度 {reading['percent']:g}% 低于 {self.MIN_ACCOUNT_HEALTH}%，当日锁定"
+        self._exclude_queued_entries(account['id'], reason, all_opens=True)
+        self._log('warning', f"{account['name']} {reason}，已有持仓继续保护")
+
+    def _observe_snapshot_health(self, account, snapshot):
+        percent = snapshot.get('account_health')
+        if percent is None or snapshot.get('phase') != account.get('phase'):
+            return
+        metrics = account.setdefault('capital_metrics', {})
+        previous = metrics.get('health') or {}
+        reading = dict(percent=percent, text=f'{percent:g}%', current=None, limit=None,
+                       observed_at=snapshot['observed_at'], category=account.get('category',''),
+                       phase=account.get('phase'), source='vest-page', update_pending=False)
+        if snapshot['observed_at'] >= previous.get('observed_at', 0):
+            metrics['health'] = reading
+        self._lock_low_health(account, reading)
 
     def strategy_lock_account(self, aid, locked):
         with self.lock:
@@ -614,7 +654,8 @@ class Engine(PhaseAccounting, ProfitClaims):
         return (any(t['account_id']==aid and same_phase(t) and today(t.get('opened_at')) for t in self.data['history'])
                 or any(p['account_id']==aid and same_phase(p) and today(p.get('opened_at')) for p in self.data['positions'].values())
                 or any(j['account_id']==aid and j['type']=='open' and j['id']!=exclude_job_id
-                       and same_phase(j) and j.get('delivered_at') is not None and today(j['delivered_at']) for j in self.data['jobs'].values()))
+                       and same_phase(j) and j.get('skip_reason')!='account_health'
+                       and j.get('delivered_at') is not None and today(j['delivered_at']) for j in self.data['jobs'].values()))
 
     @staticmethod
     def _position_exit_reason(account, position):
@@ -665,6 +706,8 @@ class Engine(PhaseAccounting, ProfitClaims):
             self._save()
         account = self._account(aid)
         self._assert_execution_allowed(account)
+        if self._health_locked(account):
+            raise ValidationError(f"{account['name']} 账户健康度锁定，下一交易日可重新核验")
         if account.get('phase_pending'):
             raise ValidationError('阶段切换同步中，等待明确空仓读数')
         locked=account.get('strategy_locked')
@@ -1203,6 +1246,7 @@ class Engine(PhaseAccounting, ProfitClaims):
         if s['phase'] == 'submitting':
             # Accounts can be locked while the per-account jitter is running.
             s['order_queue'] = [a for a in s['order_queue'] if not self._account(a).get('strategy_locked')
+                                and not self._health_locked(self._account(a))
                                 and self._account(a)['enabled'] and self._account(a)['status']=='active']
             if not s['order_queue']:
                 s['phase'] = 'monitoring'
@@ -1297,7 +1341,9 @@ class Engine(PhaseAccounting, ProfitClaims):
     def _snapshot(self, raw):
         if not isinstance(raw, dict):
             return {}
+        health = number(raw.get('account_health'))
         return {'balance': number(raw.get('balance')), 'equity': number(raw.get('equity')),
+                **({'account_health': health} if health is not None and 0 <= health <= 100 else {}),
                 **({'phase':raw['phase']} if raw.get('phase') in PHASES else {}),
                 'entry_price': number(raw.get('entry_price')), 'quantity': number(raw.get('quantity')),
                 'side': raw.get('side') if raw.get('side') in ('buy','sell') else None,
@@ -1350,7 +1396,7 @@ class Engine(PhaseAccounting, ProfitClaims):
         if raw is None:
             raw = {}
         if not isinstance(raw,dict) or set(raw)-set(self.CAPITAL_METRICS):
-            raise ValidationError('账户指标只接受 daily_loss / drawdown / goal 对象')
+            raise ValidationError('账户指标只接受 daily_loss / drawdown / goal / health 对象')
         result = {}
         previous = previous or {}
         for key in self.CAPITAL_METRICS:
@@ -1370,9 +1416,10 @@ class Engine(PhaseAccounting, ProfitClaims):
             values = {name:self._observation_money(incoming,name) for name in ('current','limit','percent')}
             pair = values['current'] is not None and values['limit'] is not None and values['limit']>=0 and values['percent'] is None
             percentage = values['current'] is None and values['limit'] is None and values['percent'] is not None and values['percent']>=0
+            valid_reading = (percentage and values['percent']<=100) if key=='health' else (pair or percentage)
             metric_category = incoming.get('category',category)
             if (not isinstance(text,str) or not 1<=len(text)<=160 or stamp is None or not 0<stamp<=self.clock()+5
-                or not (pair or percentage) or not isinstance(metric_category,str) or len(metric_category)>120
+                or not valid_reading or not isinstance(metric_category,str) or len(metric_category)>120
                 or ('update_pending' in incoming and not isinstance(incoming['update_pending'],bool))):
                 raise ValidationError('账户指标文本、金额、比例或观察时间无效')
             if isinstance(prior,dict) and prior['observed_at']>stamp:
@@ -1737,6 +1784,8 @@ class Engine(PhaseAccounting, ProfitClaims):
                     account['lock_reason'] = '平台账户状态为 '+row['category']
                 self._enforce_retired_failure(account)
                 self._enforce_archived_account(account)
+                if not account['ambiguous']:
+                    self._lock_low_health(account, account.get('capital_metrics', {}).get('health'))
                 row['account_id'] = aid if not account['ambiguous'] else None
                 row['account_scope'] = scope
                 row['auto_discovered'] = True
@@ -1861,6 +1910,7 @@ class Engine(PhaseAccounting, ProfitClaims):
                 session.update({'session_id':account['session_id'],'identity':account['identity'],'mode_epoch':body['mode_epoch']})
             self.data['bridge_sessions'][aid] = session
             if self._fresh(aid):
+                self._observe_snapshot_health(account, snapshot)
                 if snapshot.get('symbol') == 'NQ-PERP':
                     self._observe_browser_price(snapshot)
                 account['balance'] = snapshot['balance']
@@ -1915,6 +1965,9 @@ class Engine(PhaseAccounting, ProfitClaims):
                     if candidate['account_id'] != aid or candidate['status']!='queued':
                         continue
                     if candidate['type']=='open' and self._pending_profit_claims():continue
+                    if candidate['type']=='open' and self._health_locked(account):
+                        candidate.update(status='cancelled', cancel_reason='账户健康度当日锁定')
+                        continue
                     if candidate['type']=='open' and candidate.get('source')=='strategy':
                         try:self._assert_strategy_batch_side(aid,candidate)
                         except ValidationError as exc:
@@ -2010,6 +2063,10 @@ class Engine(PhaseAccounting, ProfitClaims):
                 or abs(self.clock()-snapshot['observed_at'])>5
                 or any(snapshot.get(k) is None for k in ('balance','unrealized_pnl','price')) or snapshot['price']<=0):
                 raise ValidationError('确认仓位大小需要新鲜且明确空仓的页面读数',409)
+            self._observe_snapshot_health(account, snapshot)
+            if self._health_locked(account):
+                self._save()
+                return {'ok':True, 'job_id':job['id'], 'skip_reason':'account_health'}
             quantity = positive(body.get('quantity'),'页面计算数量',100000)
             if job.get('quantity') is not None and not math.isclose(job['quantity'],quantity,rel_tol=1e-9,abs_tol=1e-9):
                 raise ValidationError('本任务已固定数量，禁止变更或重新计算',409)
@@ -2093,6 +2150,8 @@ class Engine(PhaseAccounting, ProfitClaims):
                 return {'ok':True,'duplicate':True,'status':job['status']}
             if job['status'] == 'confirmed':
                 return {'ok': True, 'duplicate': True}
+            if job['status']=='cancelled' and job.get('skip_reason')=='account_health':
+                return {'ok':True, 'duplicate':True, 'status':'cancelled'}
             if job['status'] != 'delivered':
                 raise ValidationError('操作结果已不再接受；请人工核对账户', 409)
             snapshot = self._snapshot(body.get('snapshot'))
@@ -2103,6 +2162,19 @@ class Engine(PhaseAccounting, ProfitClaims):
             complete = (all(number(snapshot.get(k)) is not None for k in ('balance','unrealized_pnl','price'))
                         and snapshot['price'] > 0 and abs(self.clock()-snapshot['observed_at']) <= 5)
             expected = job['type']=='open'
+            account = self._account(job['account_id'])
+            if body.get('skip_reason')=='account_health':
+                health = snapshot.get('account_health', 100)
+                if (not expected or not complete or snapshot.get('position_open') is not False
+                    or snapshot.get('phase') != job.get('phase') or snapshot.get('phase') != account.get('phase')
+                    or snapshot['observed_at'] < job['delivered_at'] or job.get('stop_amendment')
+                    or body.get('success') is not False or body.get('confirmed') is not False
+                    or (health >= self.MIN_ACCOUNT_HEALTH and not self._health_locked(account))):
+                    raise ValidationError('健康度跳过回执缺少原账户的新鲜空仓证明',409)
+                self._observe_snapshot_health(account, snapshot)
+                job.update(status='cancelled', skip_reason='account_health', cancel_reason='开仓提交前触发账户健康度锁定')
+                self._save()
+                return {'ok':True, 'status':'cancelled'}
             if expected:
                 complete = (complete and snapshot.get('entry_price') is not None and snapshot['entry_price'] > 0
                             and bool(snapshot.get('position_id')) and snapshot.get('symbol') == job['symbol']
@@ -2115,7 +2187,7 @@ class Engine(PhaseAccounting, ProfitClaims):
                 self._freeze(job['account_id'], f"浏览器操作结果未确认：{job['error']}；不自动重试，请到 Vest 核对。")
                 self._save()
                 return {'ok': False, 'status': 'unknown', 'error': job['error']}
-            account = self._account(job['account_id'])
+            self._observe_snapshot_health(account, snapshot)
             session = self.data['bridge_sessions'].get(account['id'], {})
             previous = session.get('snapshot', {})
             if job['type']=='open':
@@ -2499,6 +2571,9 @@ class Engine(PhaseAccounting, ProfitClaims):
                 self._sync_phase_book(account)
                 self._phase_summary(account,d['history'],result['trading_day'])
                 account['daily_entry_used'] = self._daily_entry_used(account['id'],window=result['entry_day'])
+                account['health_locked'] = self._health_locked(account)
+                if not account['health_locked']:
+                    account.pop('health_unlock_at', None)
                 account['strategy_unlock_at'] = (entry_day_window(account['strategy_locked_at'])['end']
                     if not execution_excluded(account) and not account.get('retired_failed') and not account.get('archived') and account.get('strategy_locked') and account.get('strategy_lock_source')!='live_default' and number(account.get('strategy_locked_at')) is not None else None)
                 if account['mode']=='browser':
@@ -2511,7 +2586,8 @@ class Engine(PhaseAccounting, ProfitClaims):
                             and account['status']=='active' and not account.get('external_position'))
                         account['ready'] = account['executable']
                         account['snapshot_ready'] = self._ready(account['id'])
-                        account['strategy_executable'] = account['executable'] and not account.get('strategy_locked',False) and not account['daily_entry_used']
+                        account['strategy_executable'] = (account['executable'] and not account.get('strategy_locked',False)
+                            and not account['health_locked'] and not account['daily_entry_used'])
                         account['data_stale'] = (not account['connected'] or account.get('observed_at') is None
                             or not 0<=now-account['observed_at']<=30)
                         account['update_pending'] = account['data_stale']
